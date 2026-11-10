@@ -14,7 +14,6 @@
 use std.str
 use std.test
 use senmlpack
-use senmlunit
 
 // The CBOR of RFC 8428 section 6, as the RFC dumps it.
 fn rfc_dump() -> [Int]
@@ -57,9 +56,12 @@ fn text_of(var out: senmlpack.SenmlBuf) -> Str
 
 // The bytes of a buffer as a list.
 fn bytes_of(var out: senmlpack.SenmlBuf) -> [Int]
+    // A closure cannot capture a @value buffer (SPEC 14.5), so list.map cannot
+    // read `out`; each byte is named in a loop instead.
     var xs: [Int] = []
     for i in 0..out.len()
-        xs = list.push(xs, out[i] as Int)
+        let b = out[i] as Int
+        xs = list.push(xs, b)
     xs
 
 // A pack of one record `t` with a value, written as CBOR, and the bytes of

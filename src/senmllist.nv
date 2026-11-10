@@ -447,9 +447,7 @@ fn json_of_record(r: SenmlRecord) -> JsonValueH
 // ```
 pub @tier(app)
 fn to_json(rs: [SenmlRecord]) -> Str
-    var items: [JsonValueH] = []
-    for r in rs
-        items = list.push(items, json_of_record(r))
+    let items: [JsonValueH] = list.map(rs, r => json_of_record(r))
     json.stringify(json.array(items))
 
 // The number a CBOR value holds, or `None`: an integer, a float of any width,
@@ -776,9 +774,7 @@ fn cbor_of_record(r: SenmlRecord) -> CborValue
 // ```
 pub @tier(app)
 fn to_cbor(rs: [SenmlRecord]) -> Bytes
-    var items: [CborValue] = []
-    for r in rs
-        items = list.push(items, cbor_of_record(r))
+    let items: [CborValue] = list.map(rs, r => cbor_of_record(r))
     cborfmt.encode(CborArray(items), CborShortest)
 
 // The base fields that carry over from one record to the next.

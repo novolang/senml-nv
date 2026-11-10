@@ -21,9 +21,12 @@ fn buf_of(xs: [Int]) -> senmlpack.SenmlBuf
 
 // The bytes of a buffer as a list.
 fn bytes_of(var out: senmlpack.SenmlBuf) -> [Int]
+    // A closure cannot capture a @value buffer (SPEC 14.5), so list.map cannot
+    // read `out`; each byte is named in a loop instead.
     var xs: [Int] = []
     for i in 0..out.len()
-        xs = list.push(xs, out[i] as Int)
+        let b = out[i] as Int
+        xs = list.push(xs, b)
     xs
 
 // What reading a list of bytes answers.
@@ -278,9 +281,7 @@ fn test_what_does_not_fit_the_pack() [io]
         eight = list.concat(eight, [0xA1, 0x00, 0x61, 0x61])
     test.assert_eq(code_of(eight), senmlread.SENML_READ_OK)
     test.case("strings past 256 bytes")
-    var big: [Int] = [0x81, 0xA1, 0x00, 0x79, 0x01, 0x2C]
-    for _k in 0..300
-        big = list.push(big, 0x61)
+    let big: [Int] = list.concat([0x81, 0xA1, 0x00, 0x79, 0x01, 0x2C], list.map(list.range(0, 300), _k => 0x61))
     test.assert_eq(code_of(big), senmlread.SENML_READ_TOO_MANY)
 
 @test
@@ -288,13 +289,7 @@ fn test_a_value_missing_and_a_value_too_deep() [io]
     test.case("a number with nothing after its label")
     test.assert_eq(code_of([0x81, 0xA1, 0x02]), senmlread.SENML_READ_TRUNCATED)
     test.case("an unknown label whose value is nested 15 deep is skipped, 16 is refused")
-    var ok_depth: [Int] = [0x81, 0xA1, 0x09]
-    for _k in 0..15
-        ok_depth = list.push(ok_depth, 0x81)
-    ok_depth = list.push(ok_depth, 0x01)
+    let ok_depth: [Int] = list.concat(list.concat([0x81, 0xA1, 0x09], list.map(list.range(0, 15), _k => 0x81)), [0x01])
     test.assert_eq(code_of(ok_depth), senmlread.SENML_READ_OK)
-    var too_deep: [Int] = [0x81, 0xA1, 0x09]
-    for _k in 0..16
-        too_deep = list.push(too_deep, 0x81)
-    too_deep = list.push(too_deep, 0x01)
+    let too_deep: [Int] = list.concat(list.concat([0x81, 0xA1, 0x09], list.map(list.range(0, 16), _k => 0x81)), [0x01])
     test.assert_eq(code_of(too_deep), senmlread.SENML_READ_MALFORMED)
