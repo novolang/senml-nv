@@ -1,0 +1,412 @@
+// senmlpack_tests.nv — the fixed pack, written as JSON and as CBOR.
+//
+// THE VECTORS ARE THE RFC'S OWN where there is one.  Section 5.1.1 gives a
+// single point as JSON, and section 6 gives the CBOR of the voltage and
+// current example of section 5.1.2 as a hex dump of 195 bytes; the pack
+// below is that example, and what this package writes is compared with the
+// dump byte for byte.  The other vectors are worked out by hand in the
+// comment above each: CBOR heads are the major type in the top three bits
+// and the argument below (0x24 is the negative integer -5, 0x61 a text
+// string of one byte), and a floating-point number is written as the
+// shortest of a half (0xF9), a single (0xFA) and a double (0xFB) that gives
+// the same value.
+
+use std.str
+use std.test
+use senmlpack
+use senmlunit
+
+// The CBOR of RFC 8428 section 6, as the RFC dumps it.
+fn rfc_dump() -> [Int]
+    [0x87, 0xa7, 0x21, 0x78, 0x1b, 0x75, 0x72, 0x6e, 0x3a, 0x64, 0x65, 0x76, 0x3a, 0x6f, 0x77, 0x3a,
+     0x31, 0x30, 0x65, 0x32, 0x30, 0x37, 0x33, 0x61, 0x30, 0x31, 0x30, 0x38, 0x30, 0x30, 0x36, 0x3a,
+     0x22, 0xfb, 0x41, 0xd3, 0x03, 0xa1, 0x5b, 0x00, 0x10, 0x62, 0x23, 0x61, 0x41, 0x20, 0x05, 0x00,
+     0x67, 0x76, 0x6f, 0x6c, 0x74, 0x61, 0x67, 0x65, 0x01, 0x61, 0x56, 0x02, 0xfb, 0x40, 0x5e, 0x06,
+     0x66, 0x66, 0x66, 0x66, 0x66, 0xa3, 0x00, 0x67, 0x63, 0x75, 0x72, 0x72, 0x65, 0x6e, 0x74, 0x06,
+     0x24, 0x02, 0xfb, 0x3f, 0xf3, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0xa3, 0x00, 0x67, 0x63, 0x75,
+     0x72, 0x72, 0x65, 0x6e, 0x74, 0x06, 0x23, 0x02, 0xfb, 0x3f, 0xf4, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc,
+     0xcd, 0xa3, 0x00, 0x67, 0x63, 0x75, 0x72, 0x72, 0x65, 0x6e, 0x74, 0x06, 0x22, 0x02, 0xfb, 0x3f,
+     0xf6, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0xa3, 0x00, 0x67, 0x63, 0x75, 0x72, 0x72, 0x65, 0x6e,
+     0x74, 0x06, 0x21, 0x02, 0xf9, 0x3e, 0x00, 0xa3, 0x00, 0x67, 0x63, 0x75, 0x72, 0x72, 0x65, 0x6e,
+     0x74, 0x06, 0x20, 0x02, 0xfb, 0x3f, 0xf9, 0x99, 0x99, 0x99, 0x99, 0x99, 0x9a, 0xa3, 0x00, 0x67,
+     0x63, 0x75, 0x72, 0x72, 0x65, 0x6e, 0x74, 0x06, 0x00, 0x02, 0xfb, 0x3f, 0xfb, 0x33, 0x33, 0x33,
+     0x33, 0x33, 0x33]
+
+// The pack of RFC 8428 section 5.1.2's second example.
+fn rfc_pack() -> senmlpack.SenmlPack
+    var p = senmlpack.pack()
+    let _ = senmlpack.set_base_name(var p, "urn:dev:ow:10e2073a0108006:")
+    senmlpack.set_base_time(var p, 1276020076.001)
+    let _ = senmlpack.set_base_unit(var p, "A")
+    senmlpack.set_version(var p, 5)
+    let v = senmlpack.add(var p, "voltage")
+    let _ = senmlpack.set_unit(var p, v, "V")
+    senmlpack.set_value(var p, v, 120.1)
+    for k in 0..6
+        let i = senmlpack.add(var p, "current")
+        senmlpack.set_time(var p, i, (k - 5) as Float)
+        senmlpack.set_value(var p, i, 1.2 + k as Float * 0.1)
+    p
+
+// The text of a buffer.
+fn text_of(var out: senmlpack.SenmlBuf) -> Str
+    var s = ""
+    for i in 0..out.len()
+        s = s + str.from_byte(out[i] as Int)
+    s
+
+// The bytes of a buffer as a list.
+fn bytes_of(var out: senmlpack.SenmlBuf) -> [Int]
+    var xs: [Int] = []
+    for i in 0..out.len()
+        xs = list.push(xs, out[i] as Int)
+    xs
+
+// A pack of one record `t` with a value, written as CBOR, and the bytes of
+// its value field (everything after the 0x81 0xA2 0x00 0x61 0x74 0x02).
+fn value_bytes(v: Float) -> [Int]
+    var p = senmlpack.pack()
+    let i = senmlpack.add(var p, "t")
+    senmlpack.set_value(var p, i, v)
+    var out: senmlpack.SenmlBuf = Vec.new()
+    var xs: [Int] = []
+    if senmlpack.to_cbor(var p, var out)
+        xs = bytes_of(var out)
+    list.slice(xs, 6, list.len(xs))
+
+// The JSON text of a pack of one record `t` with a value, between the
+// braces' fixed parts: everything after `[{"n":"t","v":` and before `}]`.
+fn value_text(v: Float) -> Str
+    var p = senmlpack.pack()
+    let i = senmlpack.add(var p, "t")
+    senmlpack.set_value(var p, i, v)
+    var out: senmlpack.SenmlBuf = Vec.new()
+    if senmlpack.to_json(var p, var out)
+        return str.slice(text_of(var out), 14, out.len() - 2)
+    "REFUSED"
+
+@test
+fn test_the_rfc_example_as_cbor_is_the_rfc_dump() [io]
+    var p = rfc_pack()
+    var out: senmlpack.SenmlBuf = Vec.new()
+    test.assert(senmlpack.to_cbor(var p, var out))
+    test.assert_eq(out.len(), 195)
+    test.assert_eq(bytes_of(var out), rfc_dump())
+
+@test
+fn test_the_rfc_examples_as_json() [io]
+    var out: senmlpack.SenmlBuf = Vec.new()
+    test.case("section 5.1.1, a single point")
+    var one = senmlpack.pack()
+    let i = senmlpack.add(var one, "urn:dev:ow:10e2073a01080063")
+    let _ = senmlpack.set_unit(var one, i, "Cel")
+    senmlpack.set_value(var one, i, 23.1)
+    test.assert(senmlpack.to_json(var one, var out))
+    test.assert_eq(text_of(var out), "[{\"n\":\"urn:dev:ow:10e2073a01080063\",\"u\":\"Cel\",\"v\":23.1}]")
+
+    test.case("section 5.1.2, with a base name, time, unit and version")
+    var p = rfc_pack()
+    test.assert(senmlpack.to_json(var p, var out))
+    test.assert_eq(text_of(var out),
+                   "[{\"bn\":\"urn:dev:ow:10e2073a0108006:\",\"bt\":1276020076.001,\"bu\":\"A\",\"bver\":5,\"n\":\"voltage\",\"u\":\"V\",\"v\":120.1},{\"n\":\"current\",\"t\":-5,\"v\":1.2},{\"n\":\"current\",\"t\":-4,\"v\":1.3},{\"n\":\"current\",\"t\":-3,\"v\":1.4},{\"n\":\"current\",\"t\":-2,\"v\":1.5},{\"n\":\"current\",\"t\":-1,\"v\":1.6},{\"n\":\"current\",\"t\":0,\"v\":1.7}]")
+
+@test
+fn test_every_field_in_json() [io]
+    var p = senmlpack.pack()
+    let _ = senmlpack.set_base_name(var p, "dev:")
+    senmlpack.set_base_value(var p, 10.0)
+    senmlpack.set_base_sum(var p, 100.0)
+    let a = senmlpack.add(var p, "a")
+    senmlpack.set_value(var p, a, 1.5)
+    senmlpack.set_update_time(var p, a, 60.0)
+    senmlpack.set_sum(var p, a, 2.0)
+    let b = senmlpack.add(var p, "b")
+    test.assert(senmlpack.set_string(var p, b, "on"))
+    let c = senmlpack.add(var p, "c")
+    senmlpack.set_bool(var p, c, true)
+    let d = senmlpack.add(var p, "d")
+    senmlpack.set_bool(var p, d, false)
+    var out: senmlpack.SenmlBuf = Vec.new()
+    test.assert(senmlpack.to_json(var p, var out))
+    // The base fields come with the first record; the order is bn bt bu bv
+    // bs bver, then n u t ut v vs vb s.
+    test.assert_eq(text_of(var out),
+                   "[{\"bn\":\"dev:\",\"bv\":10,\"bs\":100,\"n\":\"a\",\"ut\":60,\"v\":1.5,\"s\":2},{\"n\":\"b\",\"vs\":\"on\"},{\"n\":\"c\",\"vb\":true},{\"n\":\"d\",\"vb\":false}]")
+
+@test
+fn test_json_numbers() [io]
+    test.case("whole numbers and fractions")
+    test.assert_eq(value_text(0.0), "0")
+    test.assert_eq(value_text(7.0), "7")
+    test.assert_eq(value_text(-7.0), "-7")
+    test.assert_eq(value_text(100.0), "100")
+    test.assert_eq(value_text(0.5), "0.5")
+    test.assert_eq(value_text(-0.25), "-0.25")
+    test.assert_eq(value_text(23.1), "23.1")
+    test.case("leading zeros of the fraction stay")
+    test.assert_eq(value_text(0.000025), "0.000025")
+    test.assert_eq(value_text(1.05), "1.05")
+    test.case("six places, rounded, and a negative that rounds to zero is zero")
+    test.assert_eq(value_text(0.1234567), "0.123457")
+    test.assert_eq(value_text(-0.0000001), "0")
+    test.assert_eq(value_text(0.9999999), "1")
+    test.case("the largest magnitude")
+    test.assert_eq(value_text(999999999999.0), "999999999999")
+    test.assert_eq(value_text(4000000000.25), "4000000000.25")
+    test.assert_eq(value_text(5000000000.5), "5000000000.5")
+    test.assert_eq(value_text(5000000000.0004), "5000000000")
+    test.case("beyond it, and a number that is not one, are refused")
+    test.assert_eq(value_text(1000000000000.0), "REFUSED")
+    test.assert_eq(value_text(-1000000000000.0), "REFUSED")
+    test.assert_eq(value_text(float.from_bits(9221120237041090560)), "REFUSED")
+
+@test
+fn test_json_strings_are_escaped() [io]
+    var p = senmlpack.pack()
+    let i = senmlpack.add(var p, "s")
+    // The string a"b\c with a control character 0x01 and 0x1F and a line
+    // feed 0x0A in it.
+    test.assert(senmlpack.set_string(var p, i, "a\"b\\c\u{1}\u{1f}\n"))
+    var out: senmlpack.SenmlBuf = Vec.new()
+    test.assert(senmlpack.to_json(var p, var out))
+    test.assert_eq(text_of(var out), "[{\"n\":\"s\",\"vs\":\"a\\\"b\\\\c\\u0001\\u001F\\u000A\"}]")
+
+@test
+fn test_numbers_in_cbor_take_the_shortest_form() [io]
+    test.case("whole numbers are integers: heads of major type 0 and 1")
+    test.assert_eq(value_bytes(0.0), [0x00])
+    test.assert_eq(value_bytes(23.0), [0x17])
+    test.assert_eq(value_bytes(24.0), [0x18, 0x18])
+    test.assert_eq(value_bytes(255.0), [0x18, 0xFF])
+    test.assert_eq(value_bytes(256.0), [0x19, 0x01, 0x00])
+    test.assert_eq(value_bytes(65536.0), [0x1A, 0x00, 0x01, 0x00, 0x00])
+    test.assert_eq(value_bytes(4294967296.0), [0x1B, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00])
+    test.assert_eq(value_bytes(-1.0), [0x20])
+    test.assert_eq(value_bytes(-25.0), [0x38, 0x18])
+    test.assert_eq(value_bytes(-1000.0), [0x39, 0x03, 0xE7])
+    test.assert_eq(value_bytes(65504.0), [0x19, 0xFF, 0xE0])
+    // 1.5 is 1.1b x 2^0: exponent 15 << 10 = 0x3C00 and mantissa 0.5 *
+    // 1024 = 0x200: 0x3E00.
+    test.case("a half where one holds the value exactly")
+    test.assert_eq(value_bytes(1.5), [0xF9, 0x3E, 0x00])
+    test.assert_eq(value_bytes(0.5), [0xF9, 0x38, 0x00])
+    test.assert_eq(value_bytes(-2.5), [0xF9, 0xC1, 0x00])
+    // The smallest normal half is 2^-14: 0x0400.
+    test.assert_eq(value_bytes(0.00006103515625), [0xF9, 0x04, 0x00])
+    // 100000.5 is 1.10000110101000001b x 2^16: exponent 143 = 0x8F, so
+    // 0x47C35040.
+    test.case("a single where only a single does")
+    test.assert_eq(value_bytes(100000.5), [0xFA, 0x47, 0xC3, 0x50, 0x40])
+    // 2^53 is not below the integer bound; it is a single, exponent 180.
+    test.assert_eq(value_bytes(9007199254740992.0), [0xFA, 0x5A, 0x00, 0x00, 0x00])
+    test.case("a double for the rest")
+    test.assert_eq(value_bytes(120.1), [0xFB, 0x40, 0x5E, 0x06, 0x66, 0x66, 0x66, 0x66, 0x66])
+    test.assert_eq(value_bytes(0.1), [0xFB, 0x3F, 0xB9, 0x99, 0x99, 0x99, 0x99, 0x99, 0x9A])
+    test.case("infinity is a double, and NaN is the half")
+    test.assert_eq(value_bytes(float.from_bits(9218868437227405312)),
+                   [0xFB, 0x7F, 0xF0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+    test.assert_eq(value_bytes(float.from_bits(9221120237041090560)), [0xF9, 0x7E, 0x00])
+
+@test
+fn test_every_field_in_cbor() [io]
+    var p = senmlpack.pack()
+    let _ = senmlpack.set_base_name(var p, "d")
+    senmlpack.set_base_value(var p, 1.0)
+    senmlpack.set_base_sum(var p, 2.0)
+    let a = senmlpack.add(var p, "a")
+    senmlpack.set_value(var p, a, 3.0)
+    senmlpack.set_update_time(var p, a, 4.0)
+    senmlpack.set_sum(var p, a, 5.0)
+    let b = senmlpack.add(var p, "b")
+    test.assert(senmlpack.set_string(var p, b, "x"))
+    let c = senmlpack.add(var p, "c")
+    senmlpack.set_bool(var p, c, true)
+    let d = senmlpack.add(var p, "")
+    senmlpack.set_bool(var p, d, false)
+    var out: senmlpack.SenmlBuf = Vec.new()
+    test.assert(senmlpack.to_cbor(var p, var out))
+    // 84: an array of 4.
+    // A5: a map of 5: -2 "d" (21 61 64), -5 1 (24 01), -6 2 (25 02), then
+    // 0 "a" (00 61 61), ut 7: 4 (07 04), v 2: 3 (02 03), s 5: 5 (05 05).
+    // That is 7 fields: A7.
+    // A2: 0 "b" (00 61 62), 3 "x" (03 61 78).
+    // A2: 0 "c" (00 61 63), 4 true (04 F5).
+    // A1: 4 false (04 F4); the empty name is left out.
+    test.assert_eq(bytes_of(var out),
+                   [0x84, 0xA7, 0x21, 0x61, 0x64, 0x24, 0x01, 0x25, 0x02, 0x00, 0x61, 0x61, 0x07,
+                    0x04, 0x02, 0x03, 0x05, 0x05, 0xA2, 0x00, 0x61, 0x62, 0x03, 0x61, 0x78, 0xA2,
+                    0x00, 0x61, 0x63, 0x04, 0xF5, 0xA1, 0x04, 0xF4])
+
+@test
+fn test_a_pack_that_does_not_fit_is_refused_and_leaves_nothing() [io]
+    test.case("eight records fill the pool and overflow 512 bytes of JSON")
+    var p = senmlpack.pack()
+    let name = "abcdefghijklmnopqrstuvwxyz01"
+    for k in 0..8
+        let i = senmlpack.add(var p, name)
+        test.assert(i == k)
+        test.assert(senmlpack.set_unit(var p, i, "Cel"))
+        senmlpack.set_value(var p, i, 1000000.123456)
+    var out: senmlpack.SenmlBuf = Vec.new()
+    test.assert(not senmlpack.to_json(var p, var out))
+    test.assert_eq(out.len(), 0)
+    test.assert(senmlpack.to_cbor(var p, var out))
+
+    test.case("a ninth record, a full pool, and a pack that failed to build")
+    test.assert_eq(senmlpack.add(var p, "x"), -1)
+    test.assert(not p.ok)
+    test.assert(not senmlpack.to_cbor(var p, var out))
+    test.assert_eq(out.len(), 0)
+
+    test.case("a string that does not fit the pool")
+    var q = senmlpack.pack()
+    test.assert(senmlpack.set_base_name(var q, str.repeat("a", 250)))
+    test.assert(not senmlpack.set_base_name(var q, str.repeat("b", 7)))
+    test.assert(not senmlpack.set_base_unit(var q, str.repeat("b", 7)))
+    test.assert_eq(senmlpack.add(var q, str.repeat("c", 7)), -1)
+    var r = senmlpack.pack()
+    let j = senmlpack.add(var r, str.repeat("a", 250))
+    test.assert(not senmlpack.set_unit(var r, j, str.repeat("u", 7)))
+    test.assert(not senmlpack.set_string(var r, j, str.repeat("s", 7)))
+
+    test.case("a document that does not fit 512 bytes as CBOR")
+    var big = senmlpack.pack()
+    for k in 0..8
+        let i = senmlpack.add(var big, str.repeat("n", 30))
+        test.assert(senmlpack.set_string(var big, i, str.repeat("v", 1)))
+    test.assert(senmlpack.to_cbor(var big, var out))
+
+@test
+fn test_the_cbor_buffer_can_be_too_small_for_each_piece() [io]
+    // A single record whose CBOR is 6 + 1 + 1 bytes; fill the buffer to
+    // leave less than it needs, one byte at a time, for each piece the
+    // writer appends.  The output is replaced, so the buffer is filled
+    // through a pack whose content is the whole of it: a pool-full pack of
+    // one record with a 200-byte string value, twice over, is 2 * 207
+    // bytes; with a third long field it passes 512.
+    var p = senmlpack.pack()
+    let _ = senmlpack.set_base_name(var p, str.repeat("a", 120))
+    let _ = senmlpack.set_base_unit(var p, str.repeat("b", 120))
+    let i = senmlpack.add(var p, "n")
+    test.assert(senmlpack.set_string(var p, i, str.repeat("c", 10)))
+    var out: senmlpack.SenmlBuf = Vec.new()
+    test.assert(senmlpack.to_cbor(var p, var out))
+    test.assert(senmlpack.to_json(var p, var out))
+    test.case("ten records of 50 bytes: the array head fits and a record does not")
+    var q = senmlpack.pack()
+    for k in 0..8
+        let j = senmlpack.add(var q, "x")
+        senmlpack.set_value(var q, j, 1.1)
+    test.assert(senmlpack.to_json(var q, var out))
+
+@test
+fn test_resolution_of_names_units_times_values_and_sums() [io]
+    var p = senmlpack.pack()
+    let _ = senmlpack.set_base_name(var p, "dev:")
+    let _ = senmlpack.set_base_unit(var p, "A")
+    senmlpack.set_base_time(var p, 1000.0)
+    senmlpack.set_base_value(var p, 10.0)
+    senmlpack.set_base_sum(var p, 100.0)
+    let a = senmlpack.add(var p, "cur")
+    senmlpack.set_value(var p, a, 1.5)
+    senmlpack.set_time(var p, a, -5.0)
+    senmlpack.set_sum(var p, a, 2.0)
+    let b = senmlpack.add(var p, "volt")
+    let _ = senmlpack.set_unit(var p, b, "V")
+    senmlpack.set_value(var p, b, 2.0)
+    test.case("the name is the base name and the name")
+    test.assert_eq(senmlpack.rec_name_len(p, a), 7)
+    test.assert_eq(senmlpack.rec_name_byte(p, a, 0), 0x64)
+    test.assert_eq(senmlpack.rec_name_byte(p, a, 3), 0x3A)
+    test.assert_eq(senmlpack.rec_name_byte(p, a, 4), 0x63)
+    test.assert_eq(senmlpack.rec_name_byte(p, a, 6), 0x72)
+    test.assert_eq(senmlpack.rec_name_byte(p, a, 7), -1)
+    test.assert_eq(senmlpack.rec_name_byte(p, a, -1), -1)
+    test.case("the unit is its own or the base unit")
+    test.assert_eq(senmlpack.rec_unit_len(p, a), 1)
+    test.assert_eq(senmlpack.rec_unit_byte(p, a, 0), 0x41)
+    test.assert_eq(senmlpack.rec_unit_len(p, b), 1)
+    test.assert_eq(senmlpack.rec_unit_byte(p, b, 0), 0x56)
+    test.assert_eq(senmlpack.rec_unit_byte(p, b, 1), -1)
+    test.assert_eq(senmlpack.rec_unit_byte(p, b, -1), -1)
+    test.case("the time, the value and the sum have the base added")
+    test.assert_eq(senmlpack.rec_time(p, a), 995.0)
+    test.assert_eq(senmlpack.rec_time(p, b), 1000.0)
+    test.assert_eq(senmlpack.rec_value(p, a), 11.5)
+    test.assert_eq(senmlpack.rec_sum(p, a), 102.0)
+    test.case("without a base they are the record's own, and a missing time is zero")
+    var q = senmlpack.pack()
+    let c = senmlpack.add(var q, "c")
+    senmlpack.set_value(var q, c, 3.0)
+    senmlpack.set_sum(var q, c, 4.0)
+    test.assert_eq(senmlpack.rec_time(q, c), 0.0)
+    test.assert_eq(senmlpack.rec_value(q, c), 3.0)
+    test.assert_eq(senmlpack.rec_sum(q, c), 4.0)
+    test.assert_eq(senmlpack.rec_unit_len(q, c), 0)
+    test.assert(senmlpack.rec_has(q, c, senmlpack.SENML_HAS_V))
+    test.assert(not senmlpack.rec_has(q, c, senmlpack.SENML_HAS_VS))
+    test.assert(senmlpack.rec_has(q, c, senmlpack.SENML_HAS_S))
+
+@test
+fn test_validate() [io]
+    test.case("an empty pack")
+    var e = senmlpack.pack()
+    test.assert_eq(senmlpack.validate(e), senmlpack.SENML_ERR_EMPTY)
+    test.case("a version above 10")
+    var v = senmlpack.pack()
+    senmlpack.set_version(var v, 11)
+    test.assert_eq(senmlpack.validate(v), senmlpack.SENML_ERR_VERSION)
+    senmlpack.set_version(var v, 10)
+    test.assert_eq(senmlpack.validate(v), senmlpack.SENML_ERR_EMPTY)
+    test.case("a name with a space, and an empty name with no base name")
+    var n = senmlpack.pack()
+    let a = senmlpack.add(var n, "a b")
+    senmlpack.set_value(var n, a, 1.0)
+    test.assert_eq(senmlpack.validate(n), senmlpack.SENML_ERR_NAME)
+    var m = senmlpack.pack()
+    let b = senmlpack.add(var m, "")
+    senmlpack.set_value(var m, b, 1.0)
+    test.assert_eq(senmlpack.validate(m), senmlpack.SENML_ERR_NAME)
+    test.case("a name that starts with a hyphen, and one that is fine")
+    var h = senmlpack.pack()
+    let c = senmlpack.add(var h, "-a")
+    senmlpack.set_value(var h, c, 1.0)
+    test.assert_eq(senmlpack.validate(h), senmlpack.SENML_ERR_NAME)
+    var g = senmlpack.pack()
+    let d = senmlpack.add(var g, "a-b:c.d/e_f")
+    senmlpack.set_value(var g, d, 1.0)
+    test.assert_eq(senmlpack.validate(g), senmlpack.SENML_OK)
+    test.case("the base name makes an empty name valid")
+    var k = senmlpack.pack()
+    let _ = senmlpack.set_base_name(var k, "urn:x")
+    let f = senmlpack.add(var k, "")
+    senmlpack.set_value(var k, f, 1.0)
+    test.assert_eq(senmlpack.validate(k), senmlpack.SENML_OK)
+    test.case("two kinds of value, and none")
+    var two = senmlpack.pack()
+    let t = senmlpack.add(var two, "t")
+    senmlpack.set_value(var two, t, 1.0)
+    senmlpack.set_bool(var two, t, true)
+    test.assert_eq(senmlpack.validate(two), senmlpack.SENML_ERR_MANY_VALUES)
+    var three = senmlpack.pack()
+    let u = senmlpack.add(var three, "u")
+    test.assert(senmlpack.set_string(var three, u, "s"))
+    senmlpack.set_bool(var three, u, true)
+    test.assert_eq(senmlpack.validate(three), senmlpack.SENML_ERR_MANY_VALUES)
+    var none = senmlpack.pack()
+    let w = senmlpack.add(var none, "w")
+    test.assert_eq(senmlpack.validate(none), senmlpack.SENML_ERR_NO_VALUE)
+    test.case("a sum is enough, and a value with a sum is too")
+    senmlpack.set_sum(var none, w, 1.0)
+    test.assert_eq(senmlpack.validate(none), senmlpack.SENML_OK)
+    senmlpack.set_value(var none, w, 1.0)
+    test.assert_eq(senmlpack.validate(none), senmlpack.SENML_OK)
+    test.case("the RFC example is valid")
+    test.assert_eq(senmlpack.validate(rfc_pack()), senmlpack.SENML_OK)
+    test.assert_eq(senmlpack.count(rfc_pack()), 7)
+    test.assert_eq(senmlpack.SENML_DEFAULT_VERSION, 10)
+    test.assert_eq(senmlpack.SENML_MAX_RECORDS, 8)
+    test.assert_eq(senmlpack.SENML_POOL_MAX, 256)
+    test.assert_eq(senmlpack.SENML_OUT_MAX, 512)
+    test.assert_eq(senmlpack.SENML_HAS_UT, 64)
+    test.assert_eq(senmlpack.SENML_HAS_BVER, 8)

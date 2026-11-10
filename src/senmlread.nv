@@ -1,0 +1,499 @@
+// senmlread.nv — reading a SenML pack from CBOR, with no allocation.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  A gateway or an
+// actuator that receives `application/senml+cbor` reads it into a
+// `SenmlPack`, the same fixed-capacity pack a sensor builds, and then asks
+// the pack for the resolved names, units, times and values.
+//
+// WHAT IS READ. An array of maps, definite or indefinite in length, each
+// map with the integer labels of RFC 8428 Table 4: -1 to -6 for the base
+// fields and 0 to 7 for the record. A number is an integer, a half, a single
+// or a double float, or a decimal fraction (tag 4), and it is read to a
+// `Float`. A string is a definite-length text string. A label this package
+// does not know is skipped together with its value, whatever the value is,
+// unless it is a text label that ends in `_`, which section 4.4 makes an
+// error because the sender requires the reader to understand it.
+//
+// WHAT IS REFUSED, each with a code. A pack with more than 8 records or
+// more than 256 bytes of strings does not fit. A base field after the first
+// record is not representable, since the pack has one set of base fields.
+// The data value (label 8) is not carried. A value of the wrong type, a
+// float that is infinite or not a number, a decimal fraction with an
+// exponent beyond 22, and an indefinite-length text string are refused.
+// Bytes left over after the array are an error.
+//
+// THE CURSOR. The reader keeps its place and its first error in a
+// `SenmlCur`, a `@value`; after an error every later step does nothing, so
+// the code reads a field and checks once.
+
+use senmlpack
+
+// The pack was read.
+pub const SENML_READ_OK = 0
+// The buffer ended inside an item.
+pub const SENML_READ_TRUNCATED = 10
+// The bytes are not well-formed CBOR, or the top level is not an array of
+// maps.
+pub const SENML_READ_MALFORMED = 11
+// A field has the wrong type of value.
+pub const SENML_READ_TYPE = 12
+// More than 8 records, or more strings than the pool holds.
+pub const SENML_READ_TOO_MANY = 13
+// A base field after the first record.
+pub const SENML_READ_LATE_BASE = 14
+// A field this package does not carry: the data value, an indefinite
+// string, or a label ending in `_`.
+pub const SENML_READ_UNSUPPORTED = 15
+// A number out of range: infinite, not a number, or an exponent beyond 22.
+pub const SENML_READ_RANGE = 16
+// Bytes remain after the array.
+pub const SENML_READ_TRAILING = 17
+
+// A place in the buffer, the head last read, and the first error.
+pub @value
+struct SenmlCur
+    // The index of the next byte.
+    pos: Int
+    // The first error, or `SENML_READ_OK`.
+    err: Int
+    // The major type of the head last read.
+    major: Int
+    // The additional information of that head, 0 to 31.
+    info: Int
+    // Its argument: a length, a count or a number, or the bits of a float.
+    arg: Int
+
+// A cursor at the start of a buffer.
+@tier(embedded)
+@no_alloc
+fn cursor() -> SenmlCur []
+    SenmlCur { pos: 0, err: SENML_READ_OK, major: 0, info: 0, arg: 0 }
+
+// Record the first error.
+@tier(embedded)
+@no_alloc
+fn fail(var c: SenmlCur, code: Int) []
+    if c.err == SENML_READ_OK
+        c.err = code
+
+// Read `n` bytes big-endian into a number, from the cursor.
+@tier(embedded)
+@no_alloc
+fn read_be(var buf: SenmlBuf, var c: SenmlCur, n: Int) -> Int []
+    if c.pos + n > buf.len()
+        fail(var c, SENML_READ_TRUNCATED)
+        return 0
+    var v = 0
+    for i in 0..n
+        v = (v << 8) | buf[c.pos + i] as Int
+    c.pos = c.pos + n
+    v
+
+// Read a head: the major type, the additional information, and the
+// argument, which is -1 for an indefinite length.
+@tier(embedded)
+@no_alloc
+fn head(var buf: SenmlBuf, var c: SenmlCur) []
+    if c.err != SENML_READ_OK
+        return
+    if c.pos >= buf.len()
+        fail(var c, SENML_READ_TRUNCATED)
+        return
+    let b = buf[c.pos] as Int
+    c.pos = c.pos + 1
+    c.major = b >> 5
+    c.info = b & 31
+    if c.info < 24
+        c.arg = c.info
+    else if c.info == 24
+        c.arg = read_be(var buf, var c, 1)
+    else if c.info == 25
+        c.arg = read_be(var buf, var c, 2)
+    else if c.info == 26
+        c.arg = read_be(var buf, var c, 4)
+    else if c.info == 27
+        c.arg = read_be(var buf, var c, 8)
+    else if c.info == 31
+        c.arg = -1
+    else
+        fail(var c, SENML_READ_MALFORMED)
+
+// Whether there is another item in a container of `count` items, of which
+// `done` have been read; an indefinite container (`count` -1) goes on until
+// the break byte.
+@tier(embedded)
+@no_alloc
+fn more(var buf: SenmlBuf, var c: SenmlCur, count: Int, done: Int) -> Bool []
+    if c.err != SENML_READ_OK
+        return false
+    if count >= 0
+        return done < count
+    if c.pos >= buf.len()
+        fail(var c, SENML_READ_TRUNCATED)
+        return false
+    buf[c.pos] != 0xFF
+
+// Consume the break byte of an indefinite container.
+@tier(embedded)
+@no_alloc
+fn close(var c: SenmlCur, count: Int) []
+    if count < 0 and c.err == SENML_READ_OK
+        c.pos = c.pos + 1
+
+// Skip one item of any kind, nested or not.
+//
+// A stack of how many items each open container still has to give, with -1
+// for a container of indefinite length, which ends at the break byte. It
+// holds 16 levels; a deeper item is refused as malformed.
+@tier(embedded)
+@no_alloc
+fn skip_item(var buf: SenmlBuf, var c: SenmlCur) []
+    var stack: Vec[Int; 16] = Vec.new()
+    let _ = stack.push(1)
+    for _i in 0..2 * buf.len() + 2
+        if stack.len() > 0 and c.err == SENML_READ_OK
+            let top = stack[stack.len() - 1]
+            if top == 0
+                let _ = stack.pop()
+            else if top < 0 and c.pos < buf.len() and buf[c.pos] == 0xFF
+                c.pos = c.pos + 1
+                let _ = stack.pop()
+            else
+                if top > 0
+                    stack[stack.len() - 1] = top - 1
+                head(var buf, var c)
+                var inner = 0
+                var opens = false
+                if c.err == SENML_READ_OK
+                    if c.major == 2 or c.major == 3
+                        if c.arg < 0
+                            inner = -1
+                            opens = true
+                        else if c.pos + c.arg > buf.len()
+                            fail(var c, SENML_READ_TRUNCATED)
+                        else
+                            c.pos = c.pos + c.arg
+                    else if c.major == 4
+                        inner = c.arg
+                        opens = true
+                    else if c.major == 5
+                        inner = c.arg
+                        if c.arg > 0
+                            inner = 2 * c.arg
+                        opens = true
+                    else if c.major == 6
+                        inner = 1
+                        opens = true
+                if opens
+                    match stack.push(inner)
+                        Ok(_)  => 0
+                        Err(_) => fail(var c, SENML_READ_MALFORMED)
+    if stack.len() > 0
+        fail(var c, SENML_READ_TRUNCATED)
+
+// Two to the power `k`, for `k` from -160 to 160.
+@tier(embedded)
+@no_alloc
+fn pow2(k: Int) -> Float []
+    var r = 1.0
+    var n = k
+    if k < 0
+        n = 0 - k
+    for _i in 0..n
+        if k < 0
+            r = r * 0.5
+        else
+            r = r * 2.0
+    r
+
+// Ten to the power `k`, for `k` from 0 to 22, which a double holds exactly.
+@tier(embedded)
+@no_alloc
+fn pow10(k: Int) -> Float []
+    var r = 1.0
+    for _i in 0..k
+        r = r * 10.0
+    r
+
+// The value of a half-precision float given its 16 bits.
+@tier(embedded)
+@no_alloc
+fn half_value(h: Int, var c: SenmlCur) -> Float []
+    let e = (h >> 10) & 31
+    let m = h & 1023
+    if e == 31
+        fail(var c, SENML_READ_RANGE)
+        return 0.0
+    var v = 0.0
+    if e == 0
+        v = m as Float * pow2(-24)
+    else
+        v = (1024 + m) as Float * pow2(e - 25)
+    if (h >> 15) == 1
+        return 0.0 - v
+    v
+
+// The value of a single-precision float given its 32 bits.
+@tier(embedded)
+@no_alloc
+fn single_value(s: Int, var c: SenmlCur) -> Float []
+    let e = (s >> 23) & 255
+    let m = s & 8388607
+    if e == 255
+        fail(var c, SENML_READ_RANGE)
+        return 0.0
+    var v = 0.0
+    if e == 0
+        v = m as Float * pow2(-149)
+    else
+        v = (8388608 + m) as Float * pow2(e - 150)
+    if (s >> 31) == 1
+        return 0.0 - v
+    v
+
+// Read an integer, major type 0 or 1.
+@tier(embedded)
+@no_alloc
+fn read_int(var buf: SenmlBuf, var c: SenmlCur) -> Int []
+    head(var buf, var c)
+    if c.err != SENML_READ_OK
+        return 0
+    if c.major == 0 and c.arg >= 0
+        return c.arg
+    if c.major == 1 and c.arg >= 0
+        return -1 - c.arg
+    fail(var c, SENML_READ_TYPE)
+    0
+
+// Read a decimal fraction, the array of an exponent and a mantissa that
+// tag 4 qualifies, as a number.
+@tier(embedded)
+@no_alloc
+fn read_decimal(var buf: SenmlBuf, var c: SenmlCur) -> Float []
+    head(var buf, var c)
+    if c.err == SENML_READ_OK and (c.major != 4 or c.arg != 2)
+        fail(var c, SENML_READ_TYPE)
+    let exp = read_int(var buf, var c)
+    let mant = read_int(var buf, var c)
+    if c.err != SENML_READ_OK
+        return 0.0
+    if exp > 22 or exp < -22
+        fail(var c, SENML_READ_RANGE)
+        return 0.0
+    if exp < 0
+        return mant as Float / pow10(0 - exp)
+    mant as Float * pow10(exp)
+
+// Read a number: an integer, a float of any width, or a decimal fraction.
+@tier(embedded)
+@no_alloc
+fn read_number(var buf: SenmlBuf, var c: SenmlCur) -> Float []
+    head(var buf, var c)
+    if c.err != SENML_READ_OK
+        return 0.0
+    if c.major == 0 and c.arg >= 0
+        return c.arg as Float
+    if c.major == 1 and c.arg >= 0
+        return (-1 - c.arg) as Float
+    if c.major == 6 and c.arg == 4
+        return read_decimal(var buf, var c)
+    if c.major == 7 and c.info == 25
+        return half_value(c.arg, var c)
+    if c.major == 7 and c.info == 26
+        return single_value(c.arg, var c)
+    if c.major == 7 and c.info == 27
+        return float.from_bits(c.arg)
+    fail(var c, SENML_READ_TYPE)
+    0.0
+
+// Read a text string into the pool and answer where it starts; its length
+// is left in `c.arg`. Answers 0 after an error.
+@tier(embedded)
+@no_alloc
+fn read_text(var buf: SenmlBuf, var c: SenmlCur, var p: SenmlPack) -> Int []
+    head(var buf, var c)
+    if c.err != SENML_READ_OK
+        return 0
+    if c.major != 3
+        fail(var c, SENML_READ_TYPE)
+        return 0
+    if c.arg < 0
+        fail(var c, SENML_READ_UNSUPPORTED)
+        return 0
+    if c.pos + c.arg > buf.len()
+        fail(var c, SENML_READ_TRUNCATED)
+        return 0
+    if p.pool.len() + c.arg > SENML_POOL_MAX
+        fail(var c, SENML_READ_TOO_MANY)
+        return 0
+    let at = p.pool.len()
+    for k in 0..c.arg
+        let _ = p.pool.push(buf[c.pos + k])
+    c.pos = c.pos + c.arg
+    at
+
+// Read a boolean, the simple values false and true.
+@tier(embedded)
+@no_alloc
+fn read_bool(var buf: SenmlBuf, var c: SenmlCur) -> Bool []
+    head(var buf, var c)
+    if c.err == SENML_READ_OK and c.major == 7 and c.info == 21
+        return true
+    if c.err == SENML_READ_OK and (c.major != 7 or c.info != 20)
+        fail(var c, SENML_READ_TYPE)
+    false
+
+// Whether the label ends in an underscore, which makes it one the reader
+// must understand.
+@tier(embedded)
+@no_alloc
+fn must_understand(var buf: SenmlBuf, c: SenmlCur) -> Bool []
+    c.arg > 0 and (buf[c.pos + c.arg - 1] as Int) == 95
+
+// Read a base field, label -1 to -6, into the pack. Only the first record
+// may carry them.
+@tier(embedded)
+@no_alloc
+fn read_base(var buf: SenmlBuf, var c: SenmlCur, var p: SenmlPack, label: Int, first: Bool) []
+    if not first
+        fail(var c, SENML_READ_LATE_BASE)
+        return
+    if label == -1
+        let v = read_int(var buf, var c)
+        senmlpack.set_version(var p, v)
+    else if label == -2
+        let at = read_text(var buf, var c, var p)
+        p.bn_off = at
+        p.bn_len = c.arg
+    else if label == -3
+        let v = read_number(var buf, var c)
+        senmlpack.set_base_time(var p, v)
+    else if label == -4
+        let at = read_text(var buf, var c, var p)
+        p.bu_off = at
+        p.bu_len = c.arg
+    else if label == -5
+        let v = read_number(var buf, var c)
+        senmlpack.set_base_value(var p, v)
+    else
+        let v = read_number(var buf, var c)
+        senmlpack.set_base_sum(var p, v)
+
+// Read a record field, label 0 to 7, into record `i`.
+@tier(embedded)
+@no_alloc
+fn read_field(var buf: SenmlBuf, var c: SenmlCur, var p: SenmlPack, i: Int, label: Int) []
+    if label == 0
+        let at = read_text(var buf, var c, var p)
+        p.recs[i].n_off = at
+        p.recs[i].n_len = c.arg
+    else if label == 1
+        let at = read_text(var buf, var c, var p)
+        p.recs[i].u_off = at
+        p.recs[i].u_len = c.arg
+    else if label == 2
+        senmlpack.set_value(var p, i, read_number(var buf, var c))
+    else if label == 3
+        let at = read_text(var buf, var c, var p)
+        p.recs[i].s_off = at
+        p.recs[i].s_len = c.arg
+        p.recs[i].flags = p.recs[i].flags | SENML_HAS_VS
+    else if label == 4
+        senmlpack.set_bool(var p, i, read_bool(var buf, var c))
+    else if label == 5
+        senmlpack.set_sum(var p, i, read_number(var buf, var c))
+    else if label == 6
+        senmlpack.set_time(var p, i, read_number(var buf, var c))
+    else
+        senmlpack.set_update_time(var p, i, read_number(var buf, var c))
+
+// Read one key and its value into record `i`.
+@tier(embedded)
+@no_alloc
+fn read_pair(var buf: SenmlBuf, var c: SenmlCur, var p: SenmlPack, i: Int) []
+    head(var buf, var c)
+    if c.err != SENML_READ_OK
+        return
+    if c.major == 3
+        // A text label is an extension; it must be understood only if it
+        // ends in an underscore.
+        if c.arg < 0 or c.pos + c.arg > buf.len()
+            fail(var c, SENML_READ_MALFORMED)
+            return
+        let must = must_understand(var buf, c)
+        c.pos = c.pos + c.arg
+        if must
+            fail(var c, SENML_READ_UNSUPPORTED)
+            return
+        skip_item(var buf, var c)
+        return
+    var label = 0
+    if c.major == 0 and c.arg >= 0
+        label = c.arg
+    else if c.major == 1 and c.arg >= 0
+        label = -1 - c.arg
+    else
+        fail(var c, SENML_READ_MALFORMED)
+        return
+    if label == 8
+        fail(var c, SENML_READ_UNSUPPORTED)
+    else if label >= -6 and label <= -1
+        read_base(var buf, var c, var p, label, i == 0)
+    else if label >= 0 and label <= 7
+        read_field(var buf, var c, var p, i, label)
+    else
+        skip_item(var buf, var c)
+
+// Read one record, a map, into the pack as record `i`.
+@tier(embedded)
+@no_alloc
+fn read_record(var buf: SenmlBuf, var c: SenmlCur, var p: SenmlPack, i: Int) []
+    head(var buf, var c)
+    if c.err == SENML_READ_OK and c.major != 5
+        fail(var c, SENML_READ_MALFORMED)
+    let count = c.arg
+    let _ = p.recs.push(SenmlRec { flags: 0, n_off: 0, n_len: 0, u_off: 0, u_len: 0, s_off: 0,
+                                   s_len: 0, v: 0.0, sum: 0.0, t: 0.0, ut: 0.0 })
+    for k in 0..buf.len()
+        if more(var buf, var c, count, k)
+            read_pair(var buf, var c, var p, i)
+    close(var c, count)
+
+// Read a SenML pack from a CBOR buffer into an empty pack.
+//
+// Answers `SENML_READ_OK` or the first fault. The pack is then ready for
+// `senmlpack.validate` and for the resolving accessors. The buffer is the
+// whole document: bytes after the array are `SENML_READ_TRAILING`.
+//
+// ```novo
+// use senmlpack
+// use senmlread
+//
+// fn main() [io]
+//     // [{0: "t", 2: 23}]
+//     var buf: senmlpack.SenmlBuf = Vec.new()
+//     for b in [0x81, 0xA2, 0x00, 0x61, 0x74, 0x02, 0x17]
+//         let _ = buf.push(b as u8)
+//     var p = senmlpack.pack()
+//     println("${senmlread.from_cbor(var buf, var p)} ${senmlpack.count(p)} ${senmlpack.rec_value(p, 0)}")   // 0 1 23
+// ```
+pub @tier(embedded)
+@no_alloc
+fn from_cbor(var buf: SenmlBuf, var p: SenmlPack) -> Int []
+    var c = cursor()
+    head(var buf, var c)
+    if c.err == SENML_READ_OK and c.major != 4
+        fail(var c, SENML_READ_MALFORMED)
+    let count = c.arg
+    var n = 0
+    for k in 0..buf.len()
+        if more(var buf, var c, count, k)
+            if n >= SENML_MAX_RECORDS
+                fail(var c, SENML_READ_TOO_MANY)
+            else
+                read_record(var buf, var c, var p, n)
+                n = n + 1
+    close(var c, count)
+    if c.err == SENML_READ_OK and c.pos != buf.len()
+        fail(var c, SENML_READ_TRAILING)
+    c.err

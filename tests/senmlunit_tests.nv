@@ -1,0 +1,84 @@
+// senmlunit_tests.nv — the vocabularies RFC 8428 restricts.
+//
+// The unit symbols are the 58 rows of the "SenML Units" registry in section
+// 12.1, listed here in the order the registry gives them.  The name rules are
+// section 4.5.1's: A to Z, a to z, 0 to 9 and `-`, `:`, `.`, `/`, `_`,
+// starting with a letter or a digit.  The time rule is section 4.5.3's:
+// below 2^28 is relative.  ASCII: '0' 0x30, '9' 0x39, 'A' 0x41, 'Z' 0x5A,
+// 'a' 0x61, 'z' 0x7A, '-' 0x2D, ':' 0x3A, '.' 0x2E, '/' 0x2F, '_' 0x5F.
+
+use std.test
+use senmlunit
+
+@test
+fn test_every_registered_unit() [io]
+    let units = ["m", "kg", "g", "s", "A", "K", "cd", "mol", "Hz", "rad", "sr", "N", "Pa", "J",
+                 "W", "C", "V", "F", "Ohm", "S", "Wb", "T", "H", "Cel", "lm", "lx", "Bq", "Gy",
+                 "Sv", "kat", "m2", "m3", "l", "m/s", "m/s2", "m3/s", "l/s", "W/m2", "cd/m2",
+                 "bit", "bit/s", "lat", "lon", "pH", "dB", "dBW", "Bspl", "count", "/", "%",
+                 "%RH", "%EL", "EL", "1/s", "1/min", "beat/min", "beats", "S/m"]
+    test.assert_eq(list.len(units), 58)
+    for u in units
+        test.case("the unit ${u}")
+        test.assert(senmlunit.unit_is_registered(u))
+
+@test
+fn test_symbols_that_are_not_units() [io]
+    test.assert(not senmlunit.unit_is_registered(""))
+    test.assert(not senmlunit.unit_is_registered("cel"))
+    test.assert(not senmlunit.unit_is_registered("degC"))
+    test.assert(not senmlunit.unit_is_registered("m "))
+    test.assert(not senmlunit.unit_is_registered("kg2"))
+    test.assert(not senmlunit.unit_is_registered("CEL"))
+    test.assert(not senmlunit.unit_is_registered("hz"))
+
+@test
+fn test_names() [io]
+    test.case("what may start a name")
+    test.assert(senmlunit.name_start_ok(0x30))
+    test.assert(senmlunit.name_start_ok(0x39))
+    test.assert(senmlunit.name_start_ok(0x41))
+    test.assert(senmlunit.name_start_ok(0x5A))
+    test.assert(senmlunit.name_start_ok(0x61))
+    test.assert(senmlunit.name_start_ok(0x7A))
+    test.assert(not senmlunit.name_start_ok(0x2D))
+    test.assert(not senmlunit.name_start_ok(0x5F))
+    test.assert(not senmlunit.name_start_ok(0x2F))
+    test.assert(not senmlunit.name_start_ok(0x40))
+    test.assert(not senmlunit.name_start_ok(0x5B))
+    test.assert(not senmlunit.name_start_ok(0x60))
+    test.assert(not senmlunit.name_start_ok(0x7B))
+    test.assert(not senmlunit.name_start_ok(0x2F))
+    test.assert(not senmlunit.name_start_ok(0x3A))
+    test.case("what may be in one")
+    test.assert(senmlunit.name_char_ok(0x2D))
+    test.assert(senmlunit.name_char_ok(0x3A))
+    test.assert(senmlunit.name_char_ok(0x2E))
+    test.assert(senmlunit.name_char_ok(0x2F))
+    test.assert(senmlunit.name_char_ok(0x5F))
+    test.assert(senmlunit.name_char_ok(0x37))
+    test.assert(not senmlunit.name_char_ok(0x20))
+    test.assert(not senmlunit.name_char_ok(0x2B))
+    test.assert(not senmlunit.name_char_ok(0x40))
+    test.assert(not senmlunit.name_char_ok(0x7E))
+    test.assert(not senmlunit.name_char_ok(0xC3))
+    test.case("whole names")
+    test.assert(senmlunit.name_is_valid("urn:dev:ow:10e2073a01080063"))
+    test.assert(senmlunit.name_is_valid("a"))
+    test.assert(senmlunit.name_is_valid("0"))
+    test.assert(senmlunit.name_is_valid("a-b:c.d/e_f"))
+    test.assert(not senmlunit.name_is_valid(""))
+    test.assert(not senmlunit.name_is_valid("-a"))
+    test.assert(not senmlunit.name_is_valid("a b"))
+    test.assert(not senmlunit.name_is_valid("a+b"))
+    test.assert(not senmlunit.name_is_valid("é"))
+
+@test
+fn test_time_is_relative_below_two_to_the_28() [io]
+    test.assert(senmlunit.time_is_relative(0.0))
+    test.assert(senmlunit.time_is_relative(-5.0))
+    test.assert(senmlunit.time_is_relative(268435455.999))
+    test.assert(not senmlunit.time_is_relative(268435456.0))
+    test.assert(not senmlunit.time_is_relative(1276020076.001))
+    test.assert_eq(senmlunit.SENML_ABSOLUTE_TIME, 268435456)
+    test.assert_eq(senmlunit.SENML_VERSION, 10)

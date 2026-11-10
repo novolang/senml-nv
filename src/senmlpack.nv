@@ -1,0 +1,834 @@
+// senmlpack.nv — a SenML pack of fixed capacity, with no allocation.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  A sensor node
+// builds a pack of readings, writes it as JSON or CBOR into a buffer and
+// sends it, and a node that receives one reads it back with `senmlread`.
+// The pack is a `@value` the caller holds: a pool of 256 bytes for the
+// strings, and room for 8 records.  Nothing is allocated, and a reading
+// that does not fit is refused, not cut.
+//
+// WHAT A PACK HOLDS, from RFC 8428 section 4.  A record is one
+// measurement. It has a name, an optional unit, and one value, which is a
+// number, a string, a boolean or, here, a sum alone; and optionally the time
+// it was taken and how long it stays good. The base fields, a base name, base
+// time, base unit, base value, base sum and version, apply to every record
+// after them. THIS PACK HAS ONE SET OF BASE FIELDS, written with the first
+// record and applying to all of them. A pack that changes a base field part
+// way through, which the format allows, is read by `senmlread` as an error
+// and by the host's list form (`senmllist`) as it is.
+//
+// RESOLUTION, section 4.6. The name of a record is its base name followed
+// by its name, the unit is the record's or else the base unit, the time is
+// the base time plus the record's, and the value and the sum are the base
+// value and the base sum plus the record's. `rec_name_len` and
+// `rec_name_byte` read the joined name without joining it, which would
+// allocate; `rec_unit_len`, `rec_time`, `rec_value` and `rec_sum` give the
+// rest.
+//
+// NUMBERS ARE `Float`. A JSON number is written to six decimal places,
+// trailing zeros dropped, which holds a reading to a millionth; from 4.5
+// billion up a double has no room for six places, so three are written. A
+// magnitude of 10^12 or more is refused when it is written. CBOR writes a number exactly, as the shortest of an integer, a
+// half, a single and a double that gives the same value, as RFC 8428
+// section 6 asks.
+//
+// THE FIELD ORDER written is base name, base time, base unit, base value,
+// base sum, version, then name, unit, time, update time, value, string
+// value, boolean value and sum, which is the order of the examples in the RFC.
+//
+// NOT HERE: the data value `vd`, which needs base64url on the JSON side and a
+// byte string on the CBOR side. `senmllist` carries it.
+
+use senmlunit
+
+// The version a pack has when it states none: 10.
+pub const SENML_DEFAULT_VERSION = 10
+// How many records a pack holds: 8.
+pub const SENML_MAX_RECORDS = 8
+// How many bytes of strings a pack holds, base name and base unit included:
+// 256.
+pub const SENML_POOL_MAX = 256
+// The size of the buffer a pack is written into, in bytes: 512.
+pub const SENML_OUT_MAX = 512
+
+// A record has a value (`v`).
+pub const SENML_HAS_V = 1
+// A record has a string value (`vs`).
+pub const SENML_HAS_VS = 2
+// A record has a boolean value (`vb`).
+pub const SENML_HAS_VB = 4
+// The boolean value is true.
+pub const SENML_VB_TRUE = 8
+// A record has a sum (`s`).
+pub const SENML_HAS_S = 16
+// A record has a time (`t`).
+pub const SENML_HAS_T = 32
+// A record has an update time (`ut`).
+pub const SENML_HAS_UT = 64
+
+// The base fields: a base time is present.
+pub const SENML_HAS_BT = 1
+// A base value is present.
+pub const SENML_HAS_BV = 2
+// A base sum is present.
+pub const SENML_HAS_BS = 4
+// A version is present.
+pub const SENML_HAS_BVER = 8
+
+// A pack is valid.
+pub const SENML_OK = 0
+// The version is above 10, which this package does not understand.
+pub const SENML_ERR_VERSION = 1
+// A record has more than one of `v`, `vs` and `vb`.
+pub const SENML_ERR_MANY_VALUES = 2
+// A record has no value and no sum.
+pub const SENML_ERR_NO_VALUE = 3
+// A name, with its base name, has a character outside the permitted set, or
+// is empty.
+pub const SENML_ERR_NAME = 4
+// The pack has no record.
+pub const SENML_ERR_EMPTY = 5
+
+// A buffer a pack is written into.
+pub alias SenmlBuf = Vec[u8; SENML_OUT_MAX]
+
+// One measurement.
+//
+// Strings are not held here but in the pack's pool, as an offset and a
+// length.
+pub @value
+struct SenmlRec
+    // The `SENML_HAS_` and `SENML_VB_TRUE` bits.
+    flags: Int
+    // Where the name starts in the pool, and its length; 0 for none.
+    n_off: Int
+    n_len: Int
+    // The unit.
+    u_off: Int
+    u_len: Int
+    // The string value.
+    s_off: Int
+    s_len: Int
+    // The value.
+    v: Float
+    // The sum.
+    sum: Float
+    // The time.
+    t: Float
+    // The update time.
+    ut: Float
+
+// A pack of up to 8 records and the base fields that apply to them.
+pub @value
+struct SenmlPack
+    // The `SENML_HAS_B` bits for the base fields that are present.
+    base_flags: Int
+    // The version, valid when `SENML_HAS_BVER` is set.
+    bver: Int
+    // The base name in the pool.
+    bn_off: Int
+    bn_len: Int
+    // The base unit in the pool.
+    bu_off: Int
+    bu_len: Int
+    // The base time.
+    bt: Float
+    // The base value.
+    bv: Float
+    // The base sum.
+    bs: Float
+    // False after an addition that did not fit; the pack should be
+    // emptied.
+    ok: Bool
+    // The strings.
+    pool: Vec[u8; SENML_POOL_MAX]
+    // The records.
+    recs: Vec[SenmlRec; SENML_MAX_RECORDS]
+
+// A record with nothing in it.
+@tier(embedded)
+@no_alloc
+fn blank_rec() -> SenmlRec []
+    SenmlRec { flags: 0, n_off: 0, n_len: 0, u_off: 0, u_len: 0, s_off: 0, s_len: 0, v: 0.0,
+               sum: 0.0, t: 0.0, ut: 0.0 }
+
+// An empty pack.
+//
+// ```novo
+// use senmlpack
+//
+// fn main() [io]
+//     let p = senmlpack.pack()
+//     println("${senmlpack.count(p)} ${p.ok}")   // 0 true
+// ```
+pub @tier(embedded)
+@no_alloc
+fn pack() -> SenmlPack []
+    SenmlPack { base_flags: 0, bver: 0, bn_off: 0, bn_len: 0, bu_off: 0, bu_len: 0, bt: 0.0,
+                bv: 0.0, bs: 0.0, ok: true, pool: Vec.new(), recs: Vec.new() }
+
+// How many records the pack holds.
+pub @tier(embedded)
+@no_alloc
+fn count(p: SenmlPack) -> Int []
+    p.recs.len()
+
+// Copy a string into the pool and answer where it starts, or -1 when it
+// does not fit. The pool is not changed on a refusal.
+@tier(embedded)
+@no_alloc
+fn pool_put(var p: SenmlPack, s: Str) -> Int []
+    let n = str.len(s)
+    if p.pool.len() + n > SENML_POOL_MAX
+        p.ok = false
+        return -1
+    let at = p.pool.len()
+    for i in 0..n
+        let _ = p.pool.push(str.byte_at_or(s, i, 0) as u8)
+    at
+
+// Set the base name, which every record's name follows. Answers whether
+// the pool had room.
+pub @tier(embedded)
+@no_alloc
+fn set_base_name(var p: SenmlPack, s: Str) -> Bool []
+    let at = pool_put(var p, s)
+    if at < 0
+        return false
+    p.bn_off = at
+    p.bn_len = str.len(s)
+    true
+
+// Set the base unit, the unit of every record that states none.
+pub @tier(embedded)
+@no_alloc
+fn set_base_unit(var p: SenmlPack, s: Str) -> Bool []
+    let at = pool_put(var p, s)
+    if at < 0
+        return false
+    p.bu_off = at
+    p.bu_len = str.len(s)
+    true
+
+// Set the base time, which is added to the time of every record.
+pub @tier(embedded)
+@no_alloc
+fn set_base_time(var p: SenmlPack, t: Float) []
+    p.bt = t
+    p.base_flags = p.base_flags | SENML_HAS_BT
+
+// Set the base value, which is added to the value of every record that has
+// one.
+pub @tier(embedded)
+@no_alloc
+fn set_base_value(var p: SenmlPack, v: Float) []
+    p.bv = v
+    p.base_flags = p.base_flags | SENML_HAS_BV
+
+// Set the base sum, which is added to the sum of every record that has one.
+pub @tier(embedded)
+@no_alloc
+fn set_base_sum(var p: SenmlPack, s: Float) []
+    p.bs = s
+    p.base_flags = p.base_flags | SENML_HAS_BS
+
+// State the version. A pack that does not has version 10.
+pub @tier(embedded)
+@no_alloc
+fn set_version(var p: SenmlPack, v: Int) []
+    p.bver = v
+    p.base_flags = p.base_flags | SENML_HAS_BVER
+
+// Add a record with a name, and answer its index, or -1 when the pack is
+// full or the name does not fit the pool. The name may be empty when there
+// is a base name.
+//
+// The record has no value yet. Give it one with `set_value`, `set_string`,
+// `set_bool` or `set_sum`.
+//
+// ```novo
+// use senmlpack
+//
+// fn main() [io]
+//     var p = senmlpack.pack()
+//     let i = senmlpack.add(var p, "temp")
+//     senmlpack.set_value(var p, i, 23.1)
+//     println("${i} ${senmlpack.count(p)}")   // 0 1
+// ```
+pub @tier(embedded)
+@no_alloc
+fn add(var p: SenmlPack, name: Str) -> Int []
+    if p.recs.len() >= SENML_MAX_RECORDS
+        p.ok = false
+        return -1
+    let at = pool_put(var p, name)
+    if at < 0
+        return -1
+    var r = blank_rec()
+    r = SenmlRec { flags: 0, n_off: at, n_len: str.len(name), u_off: 0, u_len: 0, s_off: 0,
+                   s_len: 0, v: 0.0, sum: 0.0, t: 0.0, ut: 0.0 }
+    let _ = p.recs.push(r)
+    p.recs.len() - 1
+
+// Give record `i` a unit. Answers whether the pool had room.
+pub @tier(embedded)
+@no_alloc
+fn set_unit(var p: SenmlPack, i: Int, unit: Str) -> Bool []
+    let at = pool_put(var p, unit)
+    if at < 0
+        return false
+    p.recs[i].u_off = at
+    p.recs[i].u_len = str.len(unit)
+    true
+
+// Give record `i` a value.
+pub @tier(embedded)
+@no_alloc
+fn set_value(var p: SenmlPack, i: Int, v: Float) []
+    p.recs[i].v = v
+    p.recs[i].flags = p.recs[i].flags | SENML_HAS_V
+
+// Give record `i` a string value. Answers whether the pool had room.
+pub @tier(embedded)
+@no_alloc
+fn set_string(var p: SenmlPack, i: Int, s: Str) -> Bool []
+    let at = pool_put(var p, s)
+    if at < 0
+        return false
+    p.recs[i].s_off = at
+    p.recs[i].s_len = str.len(s)
+    p.recs[i].flags = p.recs[i].flags | SENML_HAS_VS
+    true
+
+// Give record `i` a boolean value.
+pub @tier(embedded)
+@no_alloc
+fn set_bool(var p: SenmlPack, i: Int, b: Bool) []
+    var f = p.recs[i].flags | SENML_HAS_VB
+    if b
+        f = f | SENML_VB_TRUE
+    p.recs[i].flags = f
+
+// Give record `i` a sum, the integral of its value over time.
+pub @tier(embedded)
+@no_alloc
+fn set_sum(var p: SenmlPack, i: Int, s: Float) []
+    p.recs[i].sum = s
+    p.recs[i].flags = p.recs[i].flags | SENML_HAS_S
+
+// Give record `i` a time, in seconds, to be added to the base time.
+pub @tier(embedded)
+@no_alloc
+fn set_time(var p: SenmlPack, i: Int, t: Float) []
+    p.recs[i].t = t
+    p.recs[i].flags = p.recs[i].flags | SENML_HAS_T
+
+// Give record `i` an update time, in seconds: how long the reading stays
+// good.
+pub @tier(embedded)
+@no_alloc
+fn set_update_time(var p: SenmlPack, i: Int, ut: Float) []
+    p.recs[i].ut = ut
+    p.recs[i].flags = p.recs[i].flags | SENML_HAS_UT
+
+// The length of the resolved name of record `i`: the base name and the
+// name together.
+pub @tier(embedded)
+@no_alloc
+fn rec_name_len(p: SenmlPack, i: Int) -> Int []
+    p.bn_len + p.recs[i].n_len
+
+// Byte `k` of the resolved name of record `i`, or -1 past its end.
+//
+// ```novo
+// use senmlpack
+//
+// fn main() [io]
+//     var p = senmlpack.pack()
+//     let _ = senmlpack.set_base_name(var p, "dev:1:")
+//     let i = senmlpack.add(var p, "temp")
+//     println("${senmlpack.rec_name_len(p, i)} ${senmlpack.rec_name_byte(p, i, 6)}")   // 10 116
+// ```
+pub @tier(embedded)
+@no_alloc
+fn rec_name_byte(p: SenmlPack, i: Int, k: Int) -> Int []
+    if k < 0 or k >= rec_name_len(p, i)
+        return -1
+    if k < p.bn_len
+        return p.pool[p.bn_off + k] as Int
+    p.pool[p.recs[i].n_off + k - p.bn_len] as Int
+
+// The length of the resolved unit of record `i`: its own, else the base
+// unit's, else 0.
+pub @tier(embedded)
+@no_alloc
+fn rec_unit_len(p: SenmlPack, i: Int) -> Int []
+    if p.recs[i].u_len > 0
+        return p.recs[i].u_len
+    p.bu_len
+
+// Byte `k` of the resolved unit of record `i`, or -1 past its end.
+pub @tier(embedded)
+@no_alloc
+fn rec_unit_byte(p: SenmlPack, i: Int, k: Int) -> Int []
+    if k < 0 or k >= rec_unit_len(p, i)
+        return -1
+    if p.recs[i].u_len > 0
+        return p.pool[p.recs[i].u_off + k] as Int
+    p.pool[p.bu_off + k] as Int
+
+// The resolved time of record `i`: the base time plus its own, with a
+// missing one counted as zero.
+pub @tier(embedded)
+@no_alloc
+fn rec_time(p: SenmlPack, i: Int) -> Float []
+    var t = 0.0
+    if (p.base_flags & SENML_HAS_BT) != 0
+        t = p.bt
+    if (p.recs[i].flags & SENML_HAS_T) != 0
+        t = t + p.recs[i].t
+    t
+
+// The resolved value of record `i`: the base value plus its own. Only
+// meaningful when the record has a value.
+pub @tier(embedded)
+@no_alloc
+fn rec_value(p: SenmlPack, i: Int) -> Float []
+    var v = p.recs[i].v
+    if (p.base_flags & SENML_HAS_BV) != 0
+        v = v + p.bv
+    v
+
+// The resolved sum of record `i`: the base sum plus its own. Only
+// meaningful when the record has a sum.
+pub @tier(embedded)
+@no_alloc
+fn rec_sum(p: SenmlPack, i: Int) -> Float []
+    var s = p.recs[i].sum
+    if (p.base_flags & SENML_HAS_BS) != 0
+        s = s + p.bs
+    s
+
+// Whether record `i` has a value of the kind `flag` names.
+pub @tier(embedded)
+@no_alloc
+fn rec_has(p: SenmlPack, i: Int, flag: Int) -> Bool []
+    (p.recs[i].flags & flag) != 0
+
+// Whether the resolved name of record `i` is valid by section 4.5.1: not
+// empty, starting with a letter or a digit, and made of the permitted
+// characters.
+@tier(embedded)
+@no_alloc
+fn name_ok(p: SenmlPack, i: Int) -> Bool []
+    let n = rec_name_len(p, i)
+    if n == 0 or not senmlunit.name_start_ok(rec_name_byte(p, i, 0))
+        return false
+    for k in 1..n
+        if not senmlunit.name_char_ok(rec_name_byte(p, i, k))
+            return false
+    true
+
+// Check a pack against RFC 8428.
+//
+// Answers `SENML_OK` or the first fault: a version above 10, a pack with no
+// record, a record with a bad name, more than one kind of value, or no value
+// and no sum.
+//
+// ```novo
+// use senmlpack
+//
+// fn main() [io]
+//     var p = senmlpack.pack()
+//     let i = senmlpack.add(var p, "t")
+//     println("${senmlpack.validate(p)}")   // 3, no value yet
+//     senmlpack.set_value(var p, i, 1.0)
+//     println("${senmlpack.validate(p)}")   // 0
+// ```
+pub @tier(embedded)
+@no_alloc
+fn validate(p: SenmlPack) -> Int []
+    if (p.base_flags & SENML_HAS_BVER) != 0 and p.bver > SENML_DEFAULT_VERSION
+        return SENML_ERR_VERSION
+    if p.recs.len() == 0
+        return SENML_ERR_EMPTY
+    for i in 0..p.recs.len()
+        if not name_ok(p, i)
+            return SENML_ERR_NAME
+        let f = p.recs[i].flags
+        var kinds = 0
+        if (f & SENML_HAS_V) != 0
+            kinds = kinds + 1
+        if (f & SENML_HAS_VS) != 0
+            kinds = kinds + 1
+        if (f & SENML_HAS_VB) != 0
+            kinds = kinds + 1
+        if kinds > 1
+            return SENML_ERR_MANY_VALUES
+        if kinds == 0 and (f & SENML_HAS_S) == 0
+            return SENML_ERR_NO_VALUE
+    SENML_OK
+
+// Append one byte.
+@tier(embedded)
+@no_alloc
+fn put_u8(var out: SenmlBuf, v: Int) -> Bool []
+    match out.push((v & 0xFF) as u8)
+        Ok(_)  => true
+        Err(_) => false
+
+// Append the bytes of a string.
+@tier(embedded)
+@no_alloc
+fn put_text(var out: SenmlBuf, s: Str) -> Bool []
+    var ok = true
+    for i in 0..str.len(s)
+        ok = ok and put_u8(var out, str.byte_at_or(s, i, 0))
+    ok
+
+// Append a non-negative whole number as decimal digits.
+@tier(embedded)
+@no_alloc
+fn put_uint(var out: SenmlBuf, n: Int) -> Bool []
+    var scale = 1000000000000000000
+    var ok = true
+    var started = false
+    for _i in 0..19
+        let digit = n / scale % 10
+        if digit != 0 or started or scale == 1
+            started = true
+            ok = ok and put_u8(var out, 48 + digit)
+        scale = scale / 10
+    ok
+
+// Append the fractional digits of a number scaled by a million, without the
+// trailing zeros: 500000 is "5", 25 is "000025".
+@tier(embedded)
+@no_alloc
+fn put_fraction(var out: SenmlBuf, frac: Int, width: Int) -> Bool []
+    var f = frac
+    var places = width
+    for _i in 0..width
+        if f % 10 == 0
+            f = f / 10
+            places = places - 1
+    var scale = 1
+    for _i in 1..places
+        scale = scale * 10
+    var ok = true
+    for _i in 0..places
+        ok = ok and put_u8(var out, 48 + f / scale % 10)
+        scale = scale / 10
+    ok
+
+// Append a number as JSON text with up to six decimal places, or three for a
+// magnitude of 4.5 billion or more. Answers false
+// for a magnitude of 10^12 or more and for NaN.
+@tier(embedded)
+@no_alloc
+fn put_json_number(var out: SenmlBuf, v: Float) -> Bool []
+    if v != v or v >= 1000000000000.0 or v <= -1000000000000.0
+        return false
+    var a = v
+    var negative = false
+    if v < 0.0
+        a = 0.0 - v
+        negative = true
+    // A double holds 2^52 whole units exactly, so a magnitude of 4.5 billion
+    // or more keeps three places and a smaller one six.
+    var width = 6
+    var unit = 1000000
+    if a >= 4500000000.0
+        width = 3
+        unit = 1000
+    let scaled = (a * unit as Float + 0.5) as Int
+    var ok = true
+    if negative and scaled != 0
+        ok = put_u8(var out, 45)
+    ok = ok and put_uint(var out, scaled / unit)
+    if scaled % unit != 0
+        ok = ok and put_u8(var out, 46) and put_fraction(var out, scaled % unit, width)
+    ok
+
+// Append `len` bytes of the pool as a JSON string, escaping the quote, the
+// backslash and the control characters.
+@tier(embedded)
+@no_alloc
+fn put_json_string(var out: SenmlBuf, var p: SenmlPack, off: Int, len: Int) -> Bool []
+    var ok = put_u8(var out, 34)
+    for k in 0..len
+        let b = p.pool[off + k] as Int
+        if b == 34 or b == 92
+            ok = ok and put_u8(var out, 92) and put_u8(var out, b)
+        else if b < 32
+            ok = ok and put_text(var out, "\\u00") and put_u8(var out, 48 + b / 16)
+            ok = ok and put_u8(var out, 48 + b % 16 + b % 16 / 10 * 7)
+        else
+            ok = ok and put_u8(var out, b)
+    ok and put_u8(var out, 34)
+
+// Append `,` when a field has already been written, then `"key":`.
+@tier(embedded)
+@no_alloc
+fn put_key(var out: SenmlBuf, written: Int, key: Str) -> Bool []
+    var ok = true
+    if written > 0
+        ok = put_u8(var out, 44)
+    ok and put_u8(var out, 34) and put_text(var out, key) and put_u8(var out, 34)
+        and put_u8(var out, 58)
+
+// Write record `i` as a JSON object, with the base fields when it is the
+// first.
+@tier(embedded)
+@no_alloc
+fn json_rec(var out: SenmlBuf, var p: SenmlPack, i: Int) -> Bool []
+    var ok = put_u8(var out, 123)
+    var n = 0
+    if i == 0
+        if p.bn_len > 0
+            ok = ok and put_key(var out, n, "bn") and put_json_string(var out, var p, p.bn_off, p.bn_len)
+            n = n + 1
+        if (p.base_flags & SENML_HAS_BT) != 0
+            ok = ok and put_key(var out, n, "bt") and put_json_number(var out, p.bt)
+            n = n + 1
+        if p.bu_len > 0
+            ok = ok and put_key(var out, n, "bu") and put_json_string(var out, var p, p.bu_off, p.bu_len)
+            n = n + 1
+        if (p.base_flags & SENML_HAS_BV) != 0
+            ok = ok and put_key(var out, n, "bv") and put_json_number(var out, p.bv)
+            n = n + 1
+        if (p.base_flags & SENML_HAS_BS) != 0
+            ok = ok and put_key(var out, n, "bs") and put_json_number(var out, p.bs)
+            n = n + 1
+        if (p.base_flags & SENML_HAS_BVER) != 0
+            ok = ok and put_key(var out, n, "bver") and put_json_number(var out, p.bver as Float)
+            n = n + 1
+    let r = p.recs[i]
+    if r.n_len > 0
+        ok = ok and put_key(var out, n, "n") and put_json_string(var out, var p, r.n_off, r.n_len)
+        n = n + 1
+    if r.u_len > 0
+        ok = ok and put_key(var out, n, "u") and put_json_string(var out, var p, r.u_off, r.u_len)
+        n = n + 1
+    if (r.flags & SENML_HAS_T) != 0
+        ok = ok and put_key(var out, n, "t") and put_json_number(var out, r.t)
+        n = n + 1
+    if (r.flags & SENML_HAS_UT) != 0
+        ok = ok and put_key(var out, n, "ut") and put_json_number(var out, r.ut)
+        n = n + 1
+    if (r.flags & SENML_HAS_V) != 0
+        ok = ok and put_key(var out, n, "v") and put_json_number(var out, r.v)
+        n = n + 1
+    if (r.flags & SENML_HAS_VS) != 0
+        ok = ok and put_key(var out, n, "vs") and put_json_string(var out, var p, r.s_off, r.s_len)
+        n = n + 1
+    if (r.flags & SENML_HAS_VB) != 0
+        ok = ok and put_key(var out, n, "vb")
+        if (r.flags & SENML_VB_TRUE) != 0
+            ok = ok and put_text(var out, "true")
+        else
+            ok = ok and put_text(var out, "false")
+        n = n + 1
+    if (r.flags & SENML_HAS_S) != 0
+        ok = ok and put_key(var out, n, "s") and put_json_number(var out, r.sum)
+    ok and put_u8(var out, 125)
+
+// Write the pack as a JSON array, replacing what `out` held.
+//
+// Answers false, with `out` empty, when the buffer is full, a number is
+// outside what JSON text here holds, or the pack failed to build. The
+// output is `application/senml+json`.
+//
+// ```novo
+// use senmlpack
+//
+// fn main() [io]
+//     var p = senmlpack.pack()
+//     let i = senmlpack.add(var p, "urn:dev:ow:10e2073a01080063")
+//     let _ = senmlpack.set_unit(var p, i, "Cel")
+//     senmlpack.set_value(var p, i, 23.1)
+//     var out: senmlpack.SenmlBuf = Vec.new()
+//     println("${senmlpack.to_json(var p, var out)} ${out.len()}")   // true 56
+// ```
+pub @tier(embedded)
+@no_alloc
+fn to_json(var p: SenmlPack, var out: SenmlBuf) -> Bool []
+    out.clear()
+    var ok = p.ok and put_u8(var out, 91)
+    for i in 0..p.recs.len()
+        if i > 0
+            ok = ok and put_u8(var out, 44)
+        ok = ok and json_rec(var out, var p, i)
+    ok = ok and put_u8(var out, 93)
+    if not ok
+        out.clear()
+    ok
+
+// Append a CBOR head: the major type and its argument, in the shortest
+// form.
+@tier(embedded)
+@no_alloc
+fn put_head(var out: SenmlBuf, major: Int, arg: Int) -> Bool []
+    let m = major << 5
+    if arg < 24
+        return put_u8(var out, m | arg)
+    if arg < 256
+        return put_u8(var out, m | 24) and put_u8(var out, arg)
+    if arg < 65536
+        return put_u8(var out, m | 25) and put_u8(var out, arg >>> 8) and put_u8(var out, arg)
+    if arg < 4294967296
+        return put_u8(var out, m | 26) and put_u8(var out, arg >>> 24) and put_u8(var out, arg >>> 16)
+            and put_u8(var out, arg >>> 8) and put_u8(var out, arg)
+    var ok = put_u8(var out, m | 27)
+    for k in 0..8
+        ok = ok and put_u8(var out, arg >>> (56 - 8 * k))
+    ok
+
+// Append an integer, major type 0 or 1.
+@tier(embedded)
+@no_alloc
+fn put_cbor_int(var out: SenmlBuf, v: Int) -> Bool []
+    if v >= 0
+        return put_head(var out, 0, v)
+    put_head(var out, 1, -1 - v)
+
+// Append `len` bytes of the pool as a text string.
+@tier(embedded)
+@no_alloc
+fn put_cbor_text(var out: SenmlBuf, var p: SenmlPack, off: Int, len: Int) -> Bool []
+    var ok = put_head(var out, 3, len)
+    for k in 0..len
+        ok = ok and put_u8(var out, p.pool[off + k] as Int)
+    ok
+
+// Append a number in the shortest CBOR form that gives it exactly: an
+// integer when it is whole, then a half, a single, and a double.
+@tier(embedded)
+@no_alloc
+fn put_cbor_number(var out: SenmlBuf, v: Float) -> Bool []
+    if v != v
+        return put_u8(var out, 0xF9) and put_u8(var out, 0x7E) and put_u8(var out, 0x00)
+    if v > -9007199254740992.0 and v < 9007199254740992.0
+        let whole = v as Int
+        if (whole as Float) == v
+            return put_cbor_int(var out, whole)
+    let raw = float.to_bits(v)
+    let sign = (raw >>> 63) & 1
+    let e = ((raw >>> 52) & 0x7FF) - 1023
+    let mant = raw & 0xFFFFFFFFFFFFF
+    if (mant & 0x3FFFFFFFFFF) == 0 and e >= -14 and e <= 15
+        let h = (sign << 15) | ((e + 15) << 10) | (mant >>> 42)
+        return put_u8(var out, 0xF9) and put_u8(var out, h >>> 8) and put_u8(var out, h)
+    if (mant & 0x1FFFFFFF) == 0 and e >= -126 and e <= 127
+        let s = (sign << 31) | ((e + 127) << 23) | (mant >>> 29)
+        return put_u8(var out, 0xFA) and put_u8(var out, s >>> 24) and put_u8(var out, s >>> 16)
+            and put_u8(var out, s >>> 8) and put_u8(var out, s)
+    var ok = put_u8(var out, 0xFB)
+    for k in 0..8
+        ok = ok and put_u8(var out, raw >>> (56 - 8 * k))
+    ok
+
+// How many fields record `i` writes.
+@tier(embedded)
+@no_alloc
+fn field_count(p: SenmlPack, i: Int) -> Int []
+    var n = 0
+    let r = p.recs[i]
+    if i == 0
+        if p.bn_len > 0
+            n = n + 1
+        if (p.base_flags & SENML_HAS_BT) != 0
+            n = n + 1
+        if p.bu_len > 0
+            n = n + 1
+        if (p.base_flags & SENML_HAS_BV) != 0
+            n = n + 1
+        if (p.base_flags & SENML_HAS_BS) != 0
+            n = n + 1
+        if (p.base_flags & SENML_HAS_BVER) != 0
+            n = n + 1
+    if r.n_len > 0
+        n = n + 1
+    if r.u_len > 0
+        n = n + 1
+    if (r.flags & SENML_HAS_T) != 0
+        n = n + 1
+    if (r.flags & SENML_HAS_UT) != 0
+        n = n + 1
+    if (r.flags & SENML_HAS_V) != 0
+        n = n + 1
+    if (r.flags & SENML_HAS_VS) != 0
+        n = n + 1
+    if (r.flags & SENML_HAS_VB) != 0
+        n = n + 1
+    if (r.flags & SENML_HAS_S) != 0
+        n = n + 1
+    n
+
+// Write record `i` as a CBOR map with the integer labels of Table 4.
+@tier(embedded)
+@no_alloc
+fn cbor_rec(var out: SenmlBuf, var p: SenmlPack, i: Int) -> Bool []
+    var ok = put_head(var out, 5, field_count(p, i))
+    if i == 0
+        if p.bn_len > 0
+            ok = ok and put_cbor_int(var out, -2) and put_cbor_text(var out, var p, p.bn_off, p.bn_len)
+        if (p.base_flags & SENML_HAS_BT) != 0
+            ok = ok and put_cbor_int(var out, -3) and put_cbor_number(var out, p.bt)
+        if p.bu_len > 0
+            ok = ok and put_cbor_int(var out, -4) and put_cbor_text(var out, var p, p.bu_off, p.bu_len)
+        if (p.base_flags & SENML_HAS_BV) != 0
+            ok = ok and put_cbor_int(var out, -5) and put_cbor_number(var out, p.bv)
+        if (p.base_flags & SENML_HAS_BS) != 0
+            ok = ok and put_cbor_int(var out, -6) and put_cbor_number(var out, p.bs)
+        if (p.base_flags & SENML_HAS_BVER) != 0
+            ok = ok and put_cbor_int(var out, -1) and put_cbor_int(var out, p.bver)
+    let r = p.recs[i]
+    if r.n_len > 0
+        ok = ok and put_cbor_int(var out, 0) and put_cbor_text(var out, var p, r.n_off, r.n_len)
+    if r.u_len > 0
+        ok = ok and put_cbor_int(var out, 1) and put_cbor_text(var out, var p, r.u_off, r.u_len)
+    if (r.flags & SENML_HAS_T) != 0
+        ok = ok and put_cbor_int(var out, 6) and put_cbor_number(var out, r.t)
+    if (r.flags & SENML_HAS_UT) != 0
+        ok = ok and put_cbor_int(var out, 7) and put_cbor_number(var out, r.ut)
+    if (r.flags & SENML_HAS_V) != 0
+        ok = ok and put_cbor_int(var out, 2) and put_cbor_number(var out, r.v)
+    if (r.flags & SENML_HAS_VS) != 0
+        ok = ok and put_cbor_int(var out, 3) and put_cbor_text(var out, var p, r.s_off, r.s_len)
+    if (r.flags & SENML_HAS_VB) != 0
+        ok = ok and put_cbor_int(var out, 4)
+        if (r.flags & SENML_VB_TRUE) != 0
+            ok = ok and put_u8(var out, 0xF5)
+        else
+            ok = ok and put_u8(var out, 0xF4)
+    if (r.flags & SENML_HAS_S) != 0
+        ok = ok and put_cbor_int(var out, 5) and put_cbor_number(var out, r.sum)
+    ok
+
+// Write the pack as a CBOR array, replacing what `out` held.
+//
+// The array and the maps have definite lengths, as section 6 asks of a pack
+// that is not a stream. Answers false, with `out` empty, when the buffer is
+// full or the pack failed to build. The output is `application/senml+cbor`.
+//
+// ```novo
+// use senmlpack
+//
+// fn main() [io]
+//     var p = senmlpack.pack()
+//     let i = senmlpack.add(var p, "t")
+//     senmlpack.set_value(var p, i, 23.0)
+//     var out: senmlpack.SenmlBuf = Vec.new()
+//     println("${senmlpack.to_cbor(var p, var out)} ${out.len()}")   // true 7
+// ```
+pub @tier(embedded)
+@no_alloc
+fn to_cbor(var p: SenmlPack, var out: SenmlBuf) -> Bool []
+    out.clear()
+    var ok = p.ok and put_head(var out, 4, p.recs.len())
+    for i in 0..p.recs.len()
+        ok = ok and cbor_rec(var out, var p, i)
+    if not ok
+        out.clear()
+    ok

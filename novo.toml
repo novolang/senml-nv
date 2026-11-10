@@ -1,0 +1,43 @@
+[package]
+name        = "senml-nv"
+version     = "0.1.0"
+description = "SenML for novo-lang, RFC 8428: a sensor reading as a record, a pack of records with base name, time, unit and value, and the resolution of section 4.6, in JSON and in CBOR. A fixed-capacity pack for a microcontroller that writes both forms into a caller's buffer and reads CBOR back with no allocation, and a list form for a host that reads and writes JSON through the standard library and CBOR through cbor-nv."
+license     = "Apache-2.0"
+stability   = "experimental"
+
+# `core`, with one host module named below.
+#
+# The subject is a measurement format, and a measurement is made by the
+# microcontroller, so the microcontroller is the half that decides the
+# layer.  The fixed pack, the unit registry and the number arithmetic are
+# integers over buffers the caller owns, and they run on a part with
+# sixty-four kilobytes of RAM.  `tests/embedded_probe.nv` BUILDS that claim
+# for a Cortex-M.
+#
+# `senmllist` is the host half: a list of records with strings and floats
+# that a gateway or a server reads, resolves and writes.  It allocates and
+# it uses the standard library's JSON, which a device build does not have,
+# so the manifest names it and the device build leaves it out.  It declares
+# no effect.
+layer        = "core"
+host_modules = ["senmllist"]
+
+category    = "data"
+
+tags        = ["senml", "rfc8428", "iot", "sensor", "json", "cbor", "measurement", "embedded", "no-alloc"]
+repository  = "https://github.com/novolang/senml-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.23.0"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "Sensor readings as SenML, written and read by a microcontroller with no heap"
+
+[dependencies]
+# `cbor-nv` is the host half's CBOR: the value tree it encodes and decodes.
+# The device half writes and reads the CBOR heads it needs itself, because
+# a SenML record is a map of small integer labels and the heads are a few
+# lines, and because the tree is a heap value a device does not build.
+cbor-nv = "^0.1.0"

@@ -1,0 +1,405 @@
+// senmllist_tests.nv — the host list form: JSON, CBOR and resolution.
+//
+// The documents are the RFC's own where there is one.  Section 5.1.2 gives
+// the voltage and current example in JSON and section 6 gives the same
+// pack as a CBOR dump; section 5.1.3 gives a longer pack with a base time
+// and a base unit.  Resolution is checked against section 4.6: the base
+// name joined to the name, the base time added to the time, the base unit
+// where a record has none.  The base64url vectors are those of RFC 4648
+// section 10, whose alphabet differs only in `-` and `_` for `+` and `/`.
+
+use std.bytes
+use std.str
+use std.test
+use senmllist
+
+// The JSON example of RFC 8428 section 5.1.2, with its second record
+// timed.
+fn rfc_json() -> Str
+    "[{\"bn\":\"urn:dev:ow:10e2073a0108006:\",\"bt\":1.276020076001e+09,\"bu\":\"A\",\"bver\":5,\"n\":\"voltage\",\"u\":\"V\",\"v\":120.1},{\"n\":\"current\",\"t\":-5,\"v\":1.2},{\"n\":\"current\",\"t\":-4,\"v\":1.3},{\"n\":\"current\",\"t\":-3,\"v\":1.4},{\"n\":\"current\",\"t\":-2,\"v\":1.5},{\"n\":\"current\",\"t\":-1,\"v\":1.6},{\"n\":\"current\",\"v\":1.7}]"
+
+// The CBOR of RFC 8428 section 6, as the RFC dumps it.
+fn rfc_dump() -> Bytes
+    bytes.from_byte_list([0x87, 0xa7, 0x21, 0x78, 0x1b, 0x75, 0x72, 0x6e, 0x3a, 0x64, 0x65, 0x76,
+     0x3a, 0x6f, 0x77, 0x3a, 0x31, 0x30, 0x65, 0x32, 0x30, 0x37, 0x33, 0x61, 0x30, 0x31, 0x30,
+     0x38, 0x30, 0x30, 0x36, 0x3a, 0x22, 0xfb, 0x41, 0xd3, 0x03, 0xa1, 0x5b, 0x00, 0x10, 0x62,
+     0x23, 0x61, 0x41, 0x20, 0x05, 0x00, 0x67, 0x76, 0x6f, 0x6c, 0x74, 0x61, 0x67, 0x65, 0x01,
+     0x61, 0x56, 0x02, 0xfb, 0x40, 0x5e, 0x06, 0x66, 0x66, 0x66, 0x66, 0x66, 0xa3, 0x00, 0x67,
+     0x63, 0x75, 0x72, 0x72, 0x65, 0x6e, 0x74, 0x06, 0x24, 0x02, 0xfb, 0x3f, 0xf3, 0x33, 0x33,
+     0x33, 0x33, 0x33, 0x33, 0xa3, 0x00, 0x67, 0x63, 0x75, 0x72, 0x72, 0x65, 0x6e, 0x74, 0x06,
+     0x23, 0x02, 0xfb, 0x3f, 0xf4, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcd, 0xa3, 0x00, 0x67, 0x63,
+     0x75, 0x72, 0x72, 0x65, 0x6e, 0x74, 0x06, 0x22, 0x02, 0xfb, 0x3f, 0xf6, 0x66, 0x66, 0x66,
+     0x66, 0x66, 0x66, 0xa3, 0x00, 0x67, 0x63, 0x75, 0x72, 0x72, 0x65, 0x6e, 0x74, 0x06, 0x21,
+     0x02, 0xf9, 0x3e, 0x00, 0xa3, 0x00, 0x67, 0x63, 0x75, 0x72, 0x72, 0x65, 0x6e, 0x74, 0x06,
+     0x20, 0x02, 0xfb, 0x3f, 0xf9, 0x99, 0x99, 0x99, 0x99, 0x99, 0x9a, 0xa3, 0x00, 0x67, 0x63,
+     0x75, 0x72, 0x72, 0x65, 0x6e, 0x74, 0x06, 0x00, 0x02, 0xfb, 0x3f, 0xfb, 0x33, 0x33, 0x33,
+     0x33, 0x33, 0x33])
+
+// The records of a JSON text, or none.
+fn json_records(text: Str) -> [senmllist.SenmlRecord]
+    match senmllist.from_json(text)
+        Ok(rs) => rs
+        Err(_) => []
+
+// Whether reading a JSON text fails with a message containing `part`.
+fn json_error(text: Str, part: Str) -> Bool
+    match senmllist.from_json(text)
+        Ok(_)  => false
+        Err(e) => str.contains(e.message(), part)
+
+// Whether reading CBOR bytes fails with a message containing `part`.
+fn cbor_error(xs: [Int], part: Str) -> Bool
+    match senmllist.from_cbor(bytes.from_byte_list(xs))
+        Ok(_)  => false
+        Err(e) => str.contains(e.message(), part)
+
+// Whether resolving the records of a JSON text fails with `part`.
+fn resolve_error(text: Str, part: Str) -> Bool
+    match senmllist.resolve(json_records(text))
+        Ok(_)  => false
+        Err(e) => str.contains(e.message(), part)
+
+@test
+fn test_the_rfc_json_example_is_read() [io]
+    let rs = json_records(rfc_json())
+    test.assert_eq(list.len(rs), 7)
+    test.assert_eq(rs[0].base_name, Some("urn:dev:ow:10e2073a0108006:"))
+    test.assert_eq(rs[0].base_time, Some(1276020076.001))
+    test.assert_eq(rs[0].base_unit, Some("A"))
+    test.assert_eq(rs[0].version, Some(5))
+    test.assert_eq(rs[0].name, Some("voltage"))
+    test.assert_eq(rs[0].unit, Some("V"))
+    test.assert_eq(rs[0].value, Some(120.1))
+    test.assert_eq(rs[1].time, Some(-5.0))
+    test.assert_eq(rs[6].time, None)
+    test.assert_eq(rs[6].value, Some(1.7))
+
+@test
+fn test_the_rfc_example_resolves() [io]
+    match senmllist.resolve(json_records(rfc_json()))
+        Ok(out) =>
+            test.assert_eq(list.len(out), 7)
+            test.case("the name is the base name and the name")
+            test.assert_eq(out[0].name, "urn:dev:ow:10e2073a0108006:voltage")
+            test.assert_eq(out[1].name, "urn:dev:ow:10e2073a0108006:current")
+            test.case("the unit is the record's, or the base unit")
+            test.assert_eq(out[0].unit, Some("V"))
+            test.assert_eq(out[1].unit, Some("A"))
+            test.case("the time is the base time plus the record's")
+            test.assert_eq(out[0].time, 1276020076.001)
+            test.assert_eq(out[1].time, 1276020071.001)
+            test.assert_eq(out[6].time, 1276020076.001)
+            test.assert(not out[1].relative)
+            test.assert_eq(out[1].value, Some(1.2))
+        Err(e)  => test.fail(e.message())
+
+@test
+fn test_a_second_base_applies_from_its_record_on() [io]
+    // RFC 8428 section 5.1.3 in short: a base name, time and unit, then a
+    // record with its own unit, then a later record that changes the base
+    // name and the base unit.
+    let text = "[{\"bn\":\"dev1:\",\"bt\":1320067464,\"bu\":\"%RH\",\"v\":20},{\"u\":\"lon\",\"v\":24.3},{\"t\":60,\"v\":20.3},{\"bn\":\"dev2:\",\"bu\":\"Cel\",\"n\":\"x\",\"t\":10,\"v\":1}]"
+    match senmllist.resolve(json_records(text))
+        Ok(out) =>
+            test.assert_eq(out[0].name, "dev1:")
+            test.assert_eq(out[0].unit, Some("%RH"))
+            test.assert_eq(out[1].unit, Some("lon"))
+            test.assert_eq(out[2].unit, Some("%RH"))
+            test.assert_eq(out[2].time, 1320067524.0)
+            test.assert_eq(out[3].name, "dev2:x")
+            test.assert_eq(out[3].unit, Some("Cel"))
+            test.assert_eq(out[3].time, 1320067474.0)
+        Err(e)  => test.fail(e.message())
+
+@test
+fn test_base_value_and_base_sum_are_added() [io]
+    let text = "[{\"bn\":\"d:\",\"bv\":10,\"bs\":100,\"n\":\"a\",\"v\":1.5,\"s\":2},{\"n\":\"b\",\"s\":3},{\"n\":\"c\",\"vs\":\"on\"},{\"n\":\"d\",\"vb\":true}]"
+    match senmllist.resolve(json_records(text))
+        Ok(out) =>
+            test.assert_eq(out[0].value, Some(11.5))
+            test.assert_eq(out[0].sum, Some(102.0))
+            test.case("a record with a sum and no value has no value")
+            test.assert_eq(out[1].value, None)
+            test.assert_eq(out[1].sum, Some(103.0))
+            test.case("a string or a boolean has no base value added")
+            test.assert_eq(out[2].value, None)
+            test.assert_eq(out[2].string_value, Some("on"))
+            test.assert_eq(out[3].bool_value, Some(true))
+            test.assert_eq(out[2].sum, Some(100.0))
+        Err(e)  => test.fail(e.message())
+
+@test
+fn test_a_time_below_two_to_the_28_is_relative() [io]
+    match senmllist.resolve(json_records("[{\"n\":\"a\",\"t\":-5,\"v\":1},{\"n\":\"b\",\"t\":268435456,\"v\":1},{\"n\":\"c\",\"v\":1,\"ut\":30}]"))
+        Ok(out) =>
+            test.assert(out[0].relative)
+            test.assert(not out[1].relative)
+            test.assert(out[2].relative)
+            test.assert_eq(out[2].time, 0.0)
+            test.assert_eq(out[2].update_time, Some(30.0))
+        Err(e)  => test.fail(e.message())
+
+@test
+fn test_resolution_refuses_what_the_rfc_does() [io]
+    test.case("a version above 10, and one that changes")
+    test.assert(resolve_error("[{\"bver\":11,\"n\":\"a\",\"v\":1}]", "version 11"))
+    test.assert(resolve_error("[{\"bver\":5,\"n\":\"a\",\"v\":1},{\"bver\":6,\"n\":\"a\",\"v\":1}]", "version 6"))
+    test.case("the same version again is fine")
+    test.assert(not resolve_error("[{\"bver\":5,\"n\":\"a\",\"v\":1},{\"bver\":5,\"n\":\"a\",\"v\":1}]", "version"))
+    test.case("a name outside the permitted characters, and none")
+    test.assert(resolve_error("[{\"n\":\"a b\",\"v\":1}]", "not a valid SenML name"))
+    test.assert(resolve_error("[{\"v\":1}]", "not a valid SenML name"))
+    test.case("two values, and none")
+    test.assert(resolve_error("[{\"n\":\"a\",\"v\":1,\"vs\":\"x\"}]", "more than one"))
+    test.assert(resolve_error("[{\"n\":\"a\",\"vb\":true,\"vs\":\"x\"}]", "more than one"))
+    test.assert(resolve_error("[{\"n\":\"a\",\"vd\":\"AAAA\",\"vb\":true}]", "more than one"))
+    test.assert(resolve_error("[{\"n\":\"a\"}]", "no value and no sum"))
+    test.case("a sum alone is enough")
+    test.assert(not resolve_error("[{\"n\":\"a\",\"s\":1}]", "no value"))
+
+@test
+fn test_json_reading_errors() [io]
+    test.assert(json_error("not json", "does not parse"))
+    test.assert(json_error("{\"n\":\"a\"}", "top level is not an array"))
+    test.assert(json_error("[1]", "record 0 is not an object"))
+    test.case("a field of the wrong type names the field")
+    test.assert(json_error("[{\"n\":1}]", "field n has the wrong type"))
+    test.assert(json_error("[{\"n\":\"a\",\"v\":\"x\"}]", "field v has the wrong type"))
+    test.assert(json_error("[{\"n\":\"a\",\"vb\":1}]", "field vb has the wrong type"))
+    test.assert(json_error("[{\"n\":\"a\",\"v\":1},{\"bt\":\"x\"}]", "record 1: the field bt"))
+    test.case("a label ending in an underscore must be understood, others are skipped")
+    test.assert(json_error("[{\"n\":\"a\",\"v\":1,\"x_\":1}]", "label x_ must be understood"))
+    test.assert(not json_error("[{\"n\":\"a\",\"v\":1,\"x\":1}]", "x"))
+    test.assert_eq(list.len(json_records("[{\"n\":\"a\",\"v\":1,\"x\":[1,2]}]")), 1)
+    test.case("a data value that is not base64url")
+    test.assert(json_error("[{\"n\":\"a\",\"vd\":\"a=\"}]", "not base64url"))
+    test.assert(json_error("[{\"n\":\"a\",\"vd\":\"a\"}]", "not base64url"))
+
+@test
+fn test_json_numbers_integers_and_floats() [io]
+    let rs = json_records("[{\"n\":\"a\",\"v\":5,\"t\":2.5,\"bver\":10}]")
+    test.assert_eq(rs[0].value, Some(5.0))
+    test.assert_eq(rs[0].time, Some(2.5))
+    test.assert_eq(rs[0].version, Some(10))
+
+@test
+fn test_json_round_trip() [io]
+    test.case("every field is written, in the order of the RFC's examples")
+    var r = senmllist.record()
+    r.base_name = Some("dev:")
+    r.base_time = Some(1000.0)
+    r.base_unit = Some("A")
+    r.base_value = Some(1.0)
+    r.base_sum = Some(2.0)
+    r.version = Some(10)
+    r.name = Some("a")
+    r.unit = Some("V")
+    r.time = Some(-1.0)
+    r.update_time = Some(60.0)
+    r.value = Some(1.5)
+    r.sum = Some(2.5)
+    let text = senmllist.to_json([r])
+    test.assert_eq(text,
+        "[{\"bn\":\"dev:\",\"bt\":1000,\"bu\":\"A\",\"bv\":1,\"bs\":2,\"bver\":10,\"n\":\"a\",\"u\":\"V\",\"t\":-1,\"ut\":60,\"v\":1.5,\"s\":2.5}]")
+    let back = json_records(text)
+    test.assert_eq(back[0].value, Some(1.5))
+    test.assert_eq(back[0].base_time, Some(1000.0))
+    test.case("a string, a boolean and a data value")
+    var s = senmllist.record()
+    s.name = Some("s")
+    s.string_value = Some("hi")
+    var b = senmllist.record()
+    b.name = Some("b")
+    b.bool_value = Some(false)
+    var d = senmllist.record()
+    d.name = Some("d")
+    d.data_value = Some(bytes.from_byte_list([0xFB, 0xFF]))
+    let text2 = senmllist.to_json([s, b, d])
+    test.assert_eq(text2, "[{\"n\":\"s\",\"vs\":\"hi\"},{\"n\":\"b\",\"vb\":false},{\"n\":\"d\",\"vd\":\"-_8\"}]")
+    let back2 = json_records(text2)
+    test.assert_eq(back2[0].string_value, Some("hi"))
+    test.assert_eq(back2[1].bool_value, Some(false))
+    test.assert_eq(bytes.len(back2[2].data_value ?? bytes.from_byte_list([])), 2)
+    test.case("the commonest reading")
+    test.assert_eq(senmllist.to_json([senmllist.reading("temp", "Cel", 23.5)]),
+                   "[{\"n\":\"temp\",\"u\":\"Cel\",\"v\":23.5}]")
+    test.case("a pack with no record")
+    test.assert_eq(senmllist.to_json([]), "[]")
+
+@test
+fn test_the_rfc_cbor_dump_is_read() [io]
+    match senmllist.from_cbor(rfc_dump())
+        Ok(rs) =>
+            test.assert_eq(list.len(rs), 7)
+            test.assert_eq(rs[0].base_name, Some("urn:dev:ow:10e2073a0108006:"))
+            test.assert_eq(rs[0].base_time, Some(1276020076.001))
+            test.assert_eq(rs[0].base_unit, Some("A"))
+            test.assert_eq(rs[0].version, Some(5))
+            test.assert_eq(rs[0].value, Some(120.1))
+            test.assert_eq(rs[1].time, Some(-5.0))
+            test.assert_eq(rs[4].value, Some(1.5))
+            test.assert_eq(rs[6].time, Some(0.0))
+            test.case("it says the same as the JSON form")
+            let from_json = json_records(rfc_json())
+            test.assert_eq(rs[3].value, from_json[3].value)
+            test.assert_eq(rs[0].base_time, from_json[0].base_time)
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_cbor_round_trip() [io]
+    var r = senmllist.record()
+    r.base_name = Some("dev:")
+    r.base_time = Some(1276020076.001)
+    r.base_unit = Some("A")
+    r.base_value = Some(1.0)
+    r.base_sum = Some(2.0)
+    r.version = Some(10)
+    r.name = Some("a")
+    r.unit = Some("V")
+    r.time = Some(-1.0)
+    r.update_time = Some(60.0)
+    r.value = Some(1.5)
+    r.sum = Some(-2.5)
+    var s = senmllist.record()
+    s.name = Some("s")
+    s.string_value = Some("hi")
+    var b = senmllist.record()
+    b.name = Some("b")
+    b.bool_value = Some(true)
+    var d = senmllist.record()
+    d.name = Some("d")
+    d.data_value = Some(bytes.from_byte_list([1, 2, 3]))
+    var w = senmllist.record()
+    w.name = Some("w")
+    w.value = Some(7.0)
+    w.time = Some(300.0)
+    let doc = senmllist.to_cbor([r, s, b, d, w])
+    match senmllist.from_cbor(doc)
+        Ok(back) =>
+            test.assert_eq(list.len(back), 5)
+            test.assert_eq(back[0].base_time, Some(1276020076.001))
+            test.assert_eq(back[0].sum, Some(-2.5))
+            test.assert_eq(back[0].update_time, Some(60.0))
+            test.assert_eq(back[0].version, Some(10))
+            test.assert_eq(back[1].string_value, Some("hi"))
+            test.assert_eq(back[2].bool_value, Some(true))
+            test.assert_eq(bytes.len(back[3].data_value ?? bytes.from_byte_list([])), 3)
+            test.assert_eq(back[4].value, Some(7.0))
+            test.assert_eq(back[4].time, Some(300.0))
+        Err(e)   => test.fail(e.message())
+    test.case("a whole number is an integer: [{0: \"w\", 1: \"\", 2: 7}] is 9 bytes")
+    test.assert_eq(bytes.len(senmllist.to_cbor([senmllist.reading("w", "", 7.0)])), 9)
+
+@test
+fn test_decimal_fractions_are_read() [io]
+    // [{0: "t", 2: 4([-1, 231])}] is 23.1, and 4([2, 5]) is 500.
+    match senmllist.from_cbor(bytes.from_byte_list([0x81, 0xA2, 0x00, 0x61, 0x74, 0x02, 0xC4, 0x82,
+                                                    0x20, 0x18, 0xE7]))
+        Ok(rs) => test.assert_eq(rs[0].value, Some(23.1))
+        Err(e) => test.fail(e.message())
+    match senmllist.from_cbor(bytes.from_byte_list([0x81, 0xA2, 0x00, 0x61, 0x74, 0x02, 0xC4, 0x82,
+                                                    0x02, 0x05]))
+        Ok(rs) => test.assert_eq(rs[0].value, Some(500.0))
+        Err(e) => test.fail(e.message())
+    test.case("one with a wrong shape, tag or exponent is a wrong type")
+    test.assert(cbor_error([0x81, 0xA2, 0x00, 0x61, 0x74, 0x02, 0xC4, 0x81, 0x01], "field v"))
+    test.assert(cbor_error([0x81, 0xA2, 0x00, 0x61, 0x74, 0x02, 0xC5, 0x82, 0x01, 0x01], "field v"))
+    test.assert(cbor_error([0x81, 0xA2, 0x00, 0x61, 0x74, 0x02, 0xC4, 0x82, 0x17, 0x01], "field v"))
+    test.assert(cbor_error([0x81, 0xA2, 0x00, 0x61, 0x74, 0x02, 0xC4, 0x82, 0x36, 0x01], "field v"))
+    test.assert(cbor_error([0x81, 0xA2, 0x00, 0x61, 0x74, 0x02, 0xC4, 0x82, 0x61, 0x61, 0x01], "field v"))
+    test.assert(cbor_error([0x81, 0xA2, 0x00, 0x61, 0x74, 0x02, 0xC4, 0x01], "field v"))
+
+@test
+fn test_cbor_reading_errors() [io]
+    test.assert(cbor_error([], "do not decode"))
+    test.assert(cbor_error([0xA0], "top level is not an array"))
+    test.assert(cbor_error([0x81, 0x01], "record 0 is not a map"))
+    test.assert(cbor_error([0x81, 0xA1, 0xF5, 0x01], "key that is not a label"))
+    test.case("a text label is skipped, unless it ends in an underscore")
+    match senmllist.from_cbor(bytes.from_byte_list([0x81, 0xA2, 0x61, 0x78, 0x01, 0x02, 0x05]))
+        Ok(rs) => test.assert_eq(rs[0].value, Some(5.0))
+        Err(e) => test.fail(e.message())
+    test.assert(cbor_error([0x81, 0xA1, 0x62, 0x78, 0x5F, 0x01], "label x_ must be understood"))
+    test.case("an integer label not in the table is skipped")
+    match senmllist.from_cbor(bytes.from_byte_list([0x81, 0xA2, 0x09, 0x01, 0x02, 0x05]))
+        Ok(rs) => test.assert_eq(rs[0].value, Some(5.0))
+        Err(e) => test.fail(e.message())
+    test.case("every label with a value of the wrong type")
+    test.assert(cbor_error([0x81, 0xA1, 0x20, 0x61, 0x61], "field bver"))
+    test.assert(cbor_error([0x81, 0xA1, 0x21, 0x01], "field bn"))
+    test.assert(cbor_error([0x81, 0xA1, 0x22, 0x61, 0x61], "field bt"))
+    test.assert(cbor_error([0x81, 0xA1, 0x23, 0x01], "field bu"))
+    test.assert(cbor_error([0x81, 0xA1, 0x24, 0x61, 0x61], "field bv"))
+    test.assert(cbor_error([0x81, 0xA1, 0x25, 0x61, 0x61], "field bs"))
+    test.assert(cbor_error([0x81, 0xA1, 0x00, 0x01], "field n"))
+    test.assert(cbor_error([0x81, 0xA1, 0x01, 0x01], "field u"))
+    test.assert(cbor_error([0x81, 0xA1, 0x02, 0x61, 0x61], "field v"))
+    test.assert(cbor_error([0x81, 0xA1, 0x03, 0x01], "field vs"))
+    test.assert(cbor_error([0x81, 0xA1, 0x04, 0x01], "field vb"))
+    test.assert(cbor_error([0x81, 0xA1, 0x05, 0x61, 0x61], "field s"))
+    test.assert(cbor_error([0x81, 0xA1, 0x06, 0x61, 0x61], "field t"))
+    test.assert(cbor_error([0x81, 0xA1, 0x07, 0x61, 0x61], "field ut"))
+    test.assert(cbor_error([0x81, 0xA1, 0x08, 0x01], "field vd"))
+    test.case("a record after an error is not read")
+    test.assert(cbor_error([0x82, 0xA1, 0x00, 0x01, 0xA1, 0x00, 0x61, 0x61], "record 0"))
+
+@test
+fn test_base64url() [io]
+    let cases = [("", ""), ("f", "Zg"), ("fo", "Zm8"), ("foo", "Zm9v"), ("foob", "Zm9vYg"),
+                 ("fooba", "Zm9vYmE"), ("foobar", "Zm9vYmFy")]
+    for c in cases
+        var xs: [Int] = []
+        for i in 0..str.len(c.0)
+            xs = list.push(xs, str.byte_at_or(c.0, i, 0))
+        let b = bytes.from_byte_list(xs)
+        test.assert_eq(senmllist.base64url_encode(b), c.1)
+        let back = senmllist.base64url_decode(c.1) ?? bytes.from_byte_list([9])
+        test.assert_eq(bytes.len(back), str.len(c.0))
+        test.assert(back == b)
+    test.case("the URL alphabet: 62 is - and 63 is _")
+    test.assert_eq(senmllist.base64url_encode(bytes.from_byte_list([0xFB, 0xFF])), "-_8")
+    test.assert_eq(senmllist.base64url_encode(bytes.from_byte_list([0xFF, 0xFF, 0xFF])), "____")
+    test.assert_eq(senmllist.base64url_encode(bytes.from_byte_list([0xF8])), "-A")
+    test.case("what is not base64url")
+    test.assert(senmllist.base64url_decode("Zg==") == None)
+    test.assert(senmllist.base64url_decode("a") == None)
+    test.assert(senmllist.base64url_decode("Zm9v+") == None)
+    test.assert(senmllist.base64url_decode("Zm 9") == None)
+    test.assert(senmllist.base64url_decode("Zm9v/") == None)
+
+@test
+fn test_error_messages() [io]
+    test.assert_eq(senmllist.error_message(senmllist.SenmlBadJson("x")), "not a SenML pack in JSON: x")
+    test.assert_eq(senmllist.error_message(senmllist.SenmlBadCbor("y")), "not a SenML pack in CBOR: y")
+    test.assert_eq(senmllist.error_message(senmllist.SenmlBadField(2, "v")),
+                   "record 2: the field v has the wrong type")
+    test.assert_eq(senmllist.error_message(senmllist.SenmlUnsupportedLabel(1, "x_")),
+                   "record 1: the label x_ must be understood and is not")
+    test.assert_eq(senmllist.error_message(senmllist.SenmlBadVersion(11)),
+                   "SenML version 11 is above 10, which this package understands")
+    test.assert_eq(senmllist.error_message(senmllist.SenmlBadName(0, "a b")),
+                   "record 0: the name 'a b' is not a valid SenML name")
+    test.assert_eq(senmllist.error_message(senmllist.SenmlBadValue(3, "no value and no sum")),
+                   "record 3: no value and no sum")
+    test.assert_eq(senmllist.error_message(senmllist.SenmlBadData(4)),
+                   "record 4: the data value is not base64url")
+
+@test
+fn test_a_record_with_only_a_base_name_and_a_single_float() [io]
+    test.case("a record with no name is written without one")
+    var r = senmllist.record()
+    r.base_name = Some("x:")
+    r.value = Some(1.0)
+    test.assert_eq(senmllist.to_json([r]), "[{\"bn\":\"x:\",\"v\":1}]")
+    test.assert_eq(bytes.len(senmllist.to_cbor([r])), 8)
+    match senmllist.resolve([r])
+        Ok(out) => test.assert_eq(out[0].name, "x:")
+        Err(e)  => test.fail(e.message())
+    test.case("a single-precision float is read: [{2: 1.5}]")
+    match senmllist.from_cbor(bytes.from_byte_list([0x81, 0xA1, 0x02, 0xFA, 0x3F, 0xC0, 0x00, 0x00]))
+        Ok(rs) => test.assert_eq(rs[0].value, Some(1.5))
+        Err(e) => test.fail(e.message())
+    test.case("a half-precision float is read: [{2: 1.5}]")
+    match senmllist.from_cbor(bytes.from_byte_list([0x81, 0xA1, 0x02, 0xF9, 0x3E, 0x00]))
+        Ok(rs) => test.assert_eq(rs[0].value, Some(1.5))
+        Err(e) => test.fail(e.message())

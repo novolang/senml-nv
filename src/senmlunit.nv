@@ -1,0 +1,157 @@
+// senmlunit.nv — the names SenML restricts, with no allocation.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  RFC 8428 fixes three
+// small vocabularies that a producer and a consumer must agree on, and
+// each is arithmetic over bytes the caller already holds.
+//
+// THE UNITS, from the registry of section 12.1.  A unit is a short symbol
+// such as `Cel` for degrees Celsius or `%RH` for relative humidity. The
+// registry has 58 symbols, and `unit_is_registered` is the question whether
+// a symbol is one of them. A unit outside the registry is not an error in
+// the format, which carries any string, but a consumer that wants to
+// interpret the value needs a symbol it knows.
+//
+// THE NAME, from section 4.5.1. A name, or a base name and a name joined,
+// is made of the letters A to Z and a to z, the digits, and the five
+// characters `-`, `:`, `.`, `/` and `_`, and it starts with a letter or a
+// digit. The restricted set lets a name sit unchanged in a URI path or a
+// database key. `name_char_ok` and `name_start_ok` are the two tests; the
+// pack applies them to the base name and the name together without joining
+// them.
+//
+// THE TIME, from section 4.5.3. A time below 2^28, which is 268435456, is
+// seconds relative to now; at or above it, seconds since the Unix epoch.
+// `time_is_relative` is that line.
+
+// The version a pack has when it states none: 10.
+pub const SENML_VERSION = 10
+// The smallest absolute time, in seconds since the epoch: 2^28, which is
+// 1978-07-04 21:24:16 UTC. Anything below is relative to now.
+pub const SENML_ABSOLUTE_TIME = 268435456
+
+// Whether a time, base time and time added together, is relative to now.
+//
+// ```novo
+// use senmlunit
+//
+// fn main() [io]
+//     println("${senmlunit.time_is_relative(-5.0)} ${senmlunit.time_is_relative(1276020076.001)}")   // true false
+// ```
+pub @tier(embedded)
+@no_alloc
+fn time_is_relative(t: Float) -> Bool []
+    t < 268435456.0
+
+// Whether a byte may start a name: a letter or a digit.
+//
+// ```novo
+// use senmlunit
+//
+// fn main() [io]
+//     println("${senmlunit.name_start_ok(0x75)} ${senmlunit.name_start_ok(0x2D)}")   // true false
+// ```
+pub @tier(embedded)
+@no_alloc
+fn name_start_ok(b: Int) -> Bool []
+    b >= 0x41 and b <= 0x5A or b >= 0x61 and b <= 0x7A or b >= 0x30 and b <= 0x39
+
+// Whether a byte may be in a name: a letter, a digit, or one of `-`, `:`,
+// `.`, `/` and `_`.
+pub @tier(embedded)
+@no_alloc
+fn name_char_ok(b: Int) -> Bool []
+    name_start_ok(b) or b == 0x2D or b == 0x3A or b == 0x2E or b == 0x2F or b == 0x5F
+
+// Whether a string is a valid name by itself: not empty, starting with a
+// letter or a digit, and made of the characters above.
+//
+// ```novo
+// use senmlunit
+//
+// fn main() [io]
+//     println("${senmlunit.name_is_valid("urn:dev:ow:10e2073a01080063")} ${senmlunit.name_is_valid("a b")}")   // true false
+// ```
+pub @tier(embedded)
+@no_alloc
+fn name_is_valid(s: Str) -> Bool []
+    if str.len(s) == 0 or not name_start_ok(str.byte_at_or(s, 0, 0))
+        return false
+    for i in 1..str.len(s)
+        if not name_char_ok(str.byte_at_or(s, i, 0))
+            return false
+    true
+
+// Whether a symbol is in the SenML Units registry of RFC 8428 section 12.1.
+//
+// The comparison is exact and case-sensitive: `Cel` is a unit and `cel`
+// is not.
+//
+// ```novo
+// use senmlunit
+//
+// fn main() [io]
+//     println("${senmlunit.unit_is_registered("Cel")} ${senmlunit.unit_is_registered("degC")}")   // true false
+// ```
+pub @tier(embedded)
+@no_alloc
+fn unit_is_registered(u: Str) -> Bool []
+    match u
+        "m"        => true
+        "kg"       => true
+        "g"        => true
+        "s"        => true
+        "A"        => true
+        "K"        => true
+        "cd"       => true
+        "mol"      => true
+        "Hz"       => true
+        "rad"      => true
+        "sr"       => true
+        "N"        => true
+        "Pa"       => true
+        "J"        => true
+        "W"        => true
+        "C"        => true
+        "V"        => true
+        "F"        => true
+        "Ohm"      => true
+        "S"        => true
+        "Wb"       => true
+        "T"        => true
+        "H"        => true
+        "Cel"      => true
+        "lm"       => true
+        "lx"       => true
+        "Bq"       => true
+        "Gy"       => true
+        "Sv"       => true
+        "kat"      => true
+        "m2"       => true
+        "m3"       => true
+        "l"        => true
+        "m/s"      => true
+        "m/s2"     => true
+        "m3/s"     => true
+        "l/s"      => true
+        "W/m2"     => true
+        "cd/m2"    => true
+        "bit"      => true
+        "bit/s"    => true
+        "lat"      => true
+        "lon"      => true
+        "pH"       => true
+        "dB"       => true
+        "dBW"      => true
+        "Bspl"     => true
+        "count"    => true
+        "/"        => true
+        "%"        => true
+        "%RH"      => true
+        "%EL"      => true
+        "EL"       => true
+        "1/s"      => true
+        "1/min"    => true
+        "beat/min" => true
+        "beats"    => true
+        "S/m"      => true
+        _          => false

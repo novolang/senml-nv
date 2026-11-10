@@ -1,0 +1,136 @@
+// tests/embedded_probe.nv — this package's device claim, as a program
+// that either builds for a Cortex-M or does not.
+//
+// THE CONSUMER IS A SENSOR NODE: a Cortex-M that takes readings, packs them
+// as SenML and sends them as CBOR to a gateway, and takes a pack of
+// settings back and reads it, all with no heap. The probe builds the voltage
+// and current pack of RFC 8428 section 5.1.2, writes it as CBOR and checks the
+// 195 bytes of the RFC's own dump by their length, their first and last
+// bytes and their sum; reads it back and checks the resolved names, units,
+// times and values; writes it as JSON; and checks a unit and a name against
+// the registry and the name rule.
+//
+// What it checks, with the number of checks each adds:
+//
+//   - the pack written as CBOR: its length and its checksum (2)
+//   - the same bytes read back into a second pack: the count, and the
+//     resolved name, unit, time and value of two records (6)
+//   - the pack written as JSON: its length (1)
+//   - the unit registry and the name rule (3)
+//
+// The score is the sum, and a device that disagrees with the host prints how
+// many it lost.
+
+use std.str
+use senmlpack
+use senmlread
+use senmlunit
+
+// The RFC's second example.
+@tier(embedded)
+@no_alloc
+fn rfc_pack() -> SenmlPack []
+    var p = senmlpack.pack()
+    let _ = senmlpack.set_base_name(var p, "urn:dev:ow:10e2073a0108006:")
+    senmlpack.set_base_time(var p, 1276020076.001)
+    let _ = senmlpack.set_base_unit(var p, "A")
+    senmlpack.set_version(var p, 5)
+    let v = senmlpack.add(var p, "voltage")
+    let _ = senmlpack.set_unit(var p, v, "V")
+    senmlpack.set_value(var p, v, 120.1)
+    for k in 0..6
+        let i = senmlpack.add(var p, "current")
+        senmlpack.set_time(var p, i, (k - 5) as Int as Float)
+        senmlpack.set_value(var p, i, 1.2 + k as Float * 0.1)
+    p
+
+// The sum of the bytes of a buffer.
+@tier(embedded)
+@no_alloc
+fn checksum(var b: SenmlBuf) -> Int []
+    var s = 0
+    for i in 0..b.len()
+        s = s + b[i] as Int
+    s
+
+// The pack as CBOR: two checks.
+@tier(embedded)
+@no_alloc
+fn write_score() -> Int []
+    var n = 0
+    var p = rfc_pack()
+    var out: SenmlBuf = Vec.new()
+    if senmlpack.to_cbor(var p, var out) and out.len() == 195
+        n = n + 1
+    // The sum of the 195 bytes of the RFC's dump, worked out on the host.
+    if checksum(var out) == 18508
+        n = n + 1
+    n
+
+// The CBOR read back into a second pack: six checks.
+@tier(embedded)
+@no_alloc
+fn read_score() -> Int []
+    var n = 0
+    var p = rfc_pack()
+    var out: SenmlBuf = Vec.new()
+    let _ = senmlpack.to_cbor(var p, var out)
+    var q = senmlpack.pack()
+    if senmlread.from_cbor(var out, var q) == senmlread.SENML_READ_OK and senmlpack.count(q) == 7
+        n = n + 1
+    if senmlpack.validate(q) == senmlpack.SENML_OK
+        n = n + 1
+    if senmlpack.rec_name_len(q, 0) == 34 and senmlpack.rec_name_byte(q, 0, 27) == 118
+        n = n + 1
+    if senmlpack.rec_unit_byte(q, 0, 0) == 86 and senmlpack.rec_unit_byte(q, 1, 0) == 65
+        n = n + 1
+    if senmlpack.rec_time(q, 1) == 1276020071.001
+        n = n + 1
+    if senmlpack.rec_value(q, 0) == 120.1 and senmlpack.rec_value(q, 4) == 1.5
+        n = n + 1
+    n
+
+// The pack as JSON: one check.
+@tier(embedded)
+@no_alloc
+fn json_score() -> Int []
+    var p = rfc_pack()
+    var out: SenmlBuf = Vec.new()
+    if senmlpack.to_json(var p, var out) and out.len() == 293
+        return 1
+    0
+
+// The registry and the name rule: three checks.
+@tier(embedded)
+@no_alloc
+fn name_score() -> Int []
+    var n = 0
+    if senmlunit.unit_is_registered("Cel") and not senmlunit.unit_is_registered("degC")
+        n = n + 1
+    if senmlunit.name_is_valid("urn:dev:ow:10e2073a01080063") and not senmlunit.name_is_valid("a b")
+        n = n + 1
+    if senmlunit.time_is_relative(-5.0) and not senmlunit.time_is_relative(1276020076.001)
+        n = n + 1
+    n
+
+// Every answer this probe checks, folded into one number so a single
+// comparison decides the run.
+@tier(embedded)
+fn score() -> Int []
+    write_score() + read_score() + json_score() + name_score()
+
+@tier(rt)
+fn main() [hw]
+    bsp.board.init()
+    // 12 is the number of checks in `score`. The count is printed on a
+    // failure rather than only compared, so a device that disagrees with
+    // the host says how many it lost.
+    let n = score()
+    if n == 12
+        hal.uart.write("PASS: senml-embedded\n")
+    else
+        hal.uart.write("FAIL: senml-embedded score=")
+        hal.uart.write(str.from_int(n))
+        hal.uart.write("\n")
+    loop
+        hal.timer.delay_ms(1000)

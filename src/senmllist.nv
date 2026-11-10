@@ -1,0 +1,886 @@
+// senmllist.nv — SenML as a list of records, for a host.
+//
+// THE HOST HALF. A gateway, a server or a test reads a pack into a list of
+// records with strings and floats, resolves it by the algorithm of RFC 8428
+// section 4.6, and writes it back, in JSON through the standard library and in
+// CBOR through `cbor-nv`. It allocates, and the standard library's JSON is not
+// on a device, so the manifest names this module in `host_modules` and a
+// device build leaves it out. It declares no effect: reading and writing
+// SenML touches nothing outside the values it is given.
+//
+// ONE RECORD HAS EVERY FIELD, base and regular, each optional. The base fields
+// stay where the pack put them, so a pack that changes its base name part way
+// through is read as it is, which the fixed pack of `senmlpack` cannot hold.
+// `resolve` applies them.
+//
+// WHAT IS CARRIED THAT THE DEVICE FORM IS NOT: the data value `vd`, as `Bytes`,
+// and base fields in any record. A label that this package does not know is
+// skipped, as section 4.4 says, unless it ends in an underscore, in which case
+// reading the pack is an error.
+//
+// A NUMBER is a `Float`. In CBOR an integer, a half, a single, a double or a
+// decimal fraction (tag 4) is read; a whole number is written as an integer
+// and any other as a double. A time of 2^28 seconds or more is absolute, and
+// anything below is relative to now.
+
+use std.bytes
+use std.json
+use std.str
+use cborfmt
+use senmlunit
+
+// A SenML record with every field optional.
+pub struct SenmlRecord
+    // Base name, `bn`.
+    var base_name: ?Str
+    // Base time, `bt`.
+    var base_time: ?Float
+    // Base unit, `bu`.
+    var base_unit: ?Str
+    // Base value, `bv`.
+    var base_value: ?Float
+    // Base sum, `bs`.
+    var base_sum: ?Float
+    // Version, `bver`.
+    var version: ?Int
+    // Name, `n`.
+    var name: ?Str
+    // Unit, `u`.
+    var unit: ?Str
+    // Value, `v`.
+    var value: ?Float
+    // String value, `vs`.
+    var string_value: ?Str
+    // Boolean value, `vb`.
+    var bool_value: ?Bool
+    // Data value, `vd`.
+    var data_value: ?Bytes
+    // Sum, `s`.
+    var sum: ?Float
+    // Time, `t`.
+    var time: ?Float
+    // Update time, `ut`.
+    var update_time: ?Float
+
+// A record after resolution, section 4.6: no base fields, the name joined,
+// the time absolute or relative to now.
+pub struct SenmlResolved
+    // The base name and the name together.
+    name: Str
+    // The unit, the record's or the base unit.
+    unit: ?Str
+    // The value with the base value added.
+    value: ?Float
+    // The string value.
+    string_value: ?Str
+    // The boolean value.
+    bool_value: ?Bool
+    // The data value.
+    data_value: ?Bytes
+    // The sum with the base sum added.
+    sum: ?Float
+    // The time with the base time added.
+    time: Float
+    // Whether the time is relative to now: below 2^28.
+    relative: Bool
+    // The update time.
+    update_time: ?Float
+
+// What went wrong reading, writing or resolving a pack.
+//
+// The names are prefixed because a variant is constructed by name across the
+// whole assembly.
+pub enum SenmlError
+    // The text is not JSON, or its top level is not an array of objects.
+    SenmlBadJson(why: Str)
+    // The bytes are not CBOR, or the top level is not an array of maps.
+    SenmlBadCbor(why: Str)
+    // Record `index` has a field of the wrong type.
+    SenmlBadField(index: Int, field: Str)
+    // Record `index` has a label ending in an underscore that is not understood.
+    SenmlUnsupportedLabel(index: Int, label: Str)
+    // The version is above 10, or differs from the first record's.
+    SenmlBadVersion(version: Int)
+    // The resolved name of record `index` is empty or has a character outside
+    // the permitted set.
+    SenmlBadName(index: Int, name: Str)
+    // Record `index` has no value and no sum, or has more than one value.
+    SenmlBadValue(index: Int, why: Str)
+    // The data value of record `index` is not base64url.
+    SenmlBadData(index: Int)
+
+// A sentence for an error.
+//
+// ```novo
+// use senmllist
+//
+// fn main() [io]
+//     println(senmllist.error_message(senmllist.SenmlBadVersion(11)))   // SenML version 11 is above 10, which this package understands
+// ```
+pub @tier(app)
+fn error_message(e: SenmlError) -> Str
+    match e
+        SenmlBadJson(why)           => "not a SenML pack in JSON: ${why}"
+        SenmlBadCbor(why)           => "not a SenML pack in CBOR: ${why}"
+        SenmlBadField(i, f)         => "record ${i}: the field ${f} has the wrong type"
+        SenmlUnsupportedLabel(i, l) => "record ${i}: the label ${l} must be understood and is not"
+        SenmlBadVersion(v)          => "SenML version ${v} is above 10, which this package understands"
+        SenmlBadName(i, n)          => "record ${i}: the name '${n}' is not a valid SenML name"
+        SenmlBadValue(i, w)         => "record ${i}: ${w}"
+        SenmlBadData(i)             => "record ${i}: the data value is not base64url"
+
+impl Error for SenmlError
+    fn message(self) -> Str
+        error_message(self)
+
+// A record with no field set.
+//
+// ```novo
+// use senmllist
+//
+// fn main() [io]
+//     let r = senmllist.record()
+//     println("${r.name == None}")   // true
+// ```
+pub @tier(app)
+fn record() -> SenmlRecord
+    SenmlRecord { base_name: None, base_time: None, base_unit: None, base_value: None,
+                  base_sum: None, version: None, name: None, unit: None, value: None,
+                  string_value: None, bool_value: None, data_value: None, sum: None,
+                  time: None, update_time: None }
+
+// A record with a name, a unit and a value, which is the commonest reading.
+//
+// ```novo
+// use senmllist
+//
+// fn main() [io]
+//     let r = senmllist.reading("temp", "Cel", 23.1)
+//     println("${r.value ?? 0.0}")   // 23.1
+// ```
+pub @tier(app)
+fn reading(name: Str, unit: Str, value: Float) -> SenmlRecord
+    SenmlRecord { base_name: None, base_time: None, base_unit: None, base_value: None,
+                  base_sum: None, version: None, name: Some(name), unit: Some(unit),
+                  value: Some(value), string_value: None, bool_value: None, data_value: None,
+                  sum: None, time: None, update_time: None }
+
+// The base64url alphabet of RFC 4648 section 5, without padding.
+const B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+// The base64url text of some bytes, with no padding.
+//
+// ```novo
+// use std.bytes
+// use senmllist
+//
+// fn main() [io]
+//     println(senmllist.base64url_encode(bytes.from_byte_list([0xFB, 0xFF])))   // -_8
+// ```
+pub @tier(app)
+fn base64url_encode(b: Bytes) -> Str
+    var out = ""
+    let n = bytes.len(b)
+    var i = 0
+    for _k in 0..n
+        if i < n
+            let b0 = bytes.byte_at(b, i) ?? 0
+            let b1 = bytes.byte_at(b, i + 1) ?? 0
+            let b2 = bytes.byte_at(b, i + 2) ?? 0
+            let w = (b0 << 16) | (b1 << 8) | b2
+            out = out + str.slice(B64, (w >> 18) & 63, ((w >> 18) & 63) + 1)
+            out = out + str.slice(B64, (w >> 12) & 63, ((w >> 12) & 63) + 1)
+            if i + 1 < n
+                out = out + str.slice(B64, (w >> 6) & 63, ((w >> 6) & 63) + 1)
+            if i + 2 < n
+                out = out + str.slice(B64, w & 63, (w & 63) + 1)
+            i = i + 3
+    out
+
+// The index of a character in the alphabet, or -1.
+fn b64_index(c: Int) -> Int
+    if c >= 65 and c <= 90
+        return c - 65
+    if c >= 97 and c <= 122
+        return c - 71
+    if c >= 48 and c <= 57
+        return c + 4
+    if c == 45
+        return 62
+    if c == 95
+        return 63
+    -1
+
+// The bytes of base64url text, or `None` when it has a character outside the
+// alphabet, a length that no encoding gives, or padding.
+//
+// ```novo
+// use std.bytes
+// use senmllist
+//
+// fn main() [io]
+//     let b = senmllist.base64url_decode("-_8") ?? bytes.from_byte_list([])
+//     println("${bytes.len(b)} ${bytes.byte_at(b, 0) ?? 0}")   // 2 251
+// ```
+pub @tier(app)
+fn base64url_decode(s: Str) -> ?Bytes
+    let n = str.len(s)
+    if n % 4 == 1
+        return None
+    var out: [Int] = []
+    var acc = 0
+    var nbits = 0
+    for i in 0..n
+        let v = b64_index(str.byte_at_or(s, i, 0))
+        if v < 0
+            return None
+        acc = (acc << 6) | v
+        nbits = nbits + 6
+        if nbits >= 8
+            nbits = nbits - 8
+            out = list.push(out, (acc >> nbits) & 255)
+    Some(bytes.from_byte_list(out))
+
+// Ten to the power `k`, for a decimal fraction.
+fn pow10(k: Int) -> Float
+    var r = 1.0
+    for _i in 0..k
+        r = r * 10.0
+    r
+
+// The labels of the JSON form with the type each takes: "s" string, "n"
+// number, "b" boolean.
+fn json_kinds() -> [(Str, Str)]
+    [("bn", "s"), ("bt", "n"), ("bu", "s"), ("bv", "n"), ("bs", "n"), ("bver", "n"), ("n", "s"),
+     ("u", "s"), ("v", "n"), ("vs", "s"), ("vb", "b"), ("vd", "s"), ("s", "n"), ("t", "n"),
+     ("ut", "n")]
+
+// The JSON type name a kind letter stands for.
+fn json_type_of_kind(k: Str) -> Str
+    if k == "s"
+        return "string"
+    if k == "n"
+        return "number"
+    "boolean"
+
+// The first field of object `el` with the wrong type, or `None`.
+fn first_bad_field(el: JsonValueH) -> ?Str
+    for kv in json_kinds()
+        match json.get(el, kv.0)
+            None    => 0
+            Some(h) =>
+                if json.type_of(h) != json_type_of_kind(kv.1)
+                    return Some(kv.0)
+    None
+
+// The first label of object `el` that ends in an underscore, or `None`.
+fn first_required_label(el: JsonValueH) -> ?Str
+    for k in json.keys(el)
+        if str.len(k) > 0 and str.byte_at_or(k, str.len(k) - 1, 0) == 95
+            return Some(k)
+    None
+
+// A string field of an object.
+fn jstr(el: JsonValueH, key: Str) -> ?Str
+    match json.get(el, key)
+        None    => None
+        Some(h) => json.to_str(h)
+
+// A number field of an object.
+fn jnum(el: JsonValueH, key: Str) -> ?Float
+    match json.get(el, key)
+        None    => None
+        Some(h) => json.to_float(h)
+
+// A boolean field of an object.
+fn jbool(el: JsonValueH, key: Str) -> ?Bool
+    match json.get(el, key)
+        None    => None
+        Some(h) => json.to_bool(h)
+
+// A version field of an object.
+fn jint(el: JsonValueH, key: Str) -> ?Int
+    match json.get(el, key)
+        None    => None
+        Some(h) => json.to_int(h)
+
+// Record `index` read from a JSON object, or the error.
+fn record_of_json(el: JsonValueH, index: Int) -> Result<SenmlRecord, SenmlError>
+    if json.type_of(el) != "object"
+        return Err(SenmlBadJson("record ${index} is not an object"))
+    match first_bad_field(el)
+        Some(f) =>
+            return Err(SenmlBadField(index, f))
+        None    => 0
+    match first_required_label(el)
+        Some(l) =>
+            return Err(SenmlUnsupportedLabel(index, l))
+        None    => 0
+    var data: ?Bytes = None
+    match jstr(el, "vd")
+        None    => 0
+        Some(t) =>
+            match base64url_decode(t)
+                None    =>
+                    return Err(SenmlBadData(index))
+                Some(b) =>
+                    data = Some(b)
+    Ok(SenmlRecord { base_name: jstr(el, "bn"), base_time: jnum(el, "bt"),
+                     base_unit: jstr(el, "bu"), base_value: jnum(el, "bv"),
+                     base_sum: jnum(el, "bs"), version: jint(el, "bver"), name: jstr(el, "n"),
+                     unit: jstr(el, "u"), value: jnum(el, "v"), string_value: jstr(el, "vs"),
+                     bool_value: jbool(el, "vb"), data_value: data, sum: jnum(el, "s"),
+                     time: jnum(el, "t"), update_time: jnum(el, "ut") })
+
+// Read a SenML pack from JSON text into a list of records.
+//
+// The text is an array of objects. A label this package does not know is
+// skipped, and one that ends in an underscore is an error. The pack is not
+// resolved or validated: `resolve` does both.
+//
+// ```novo
+// use senmllist
+//
+// fn main() [io]
+//     match senmllist.from_json("[{\"n\":\"temp\",\"u\":\"Cel\",\"v\":23.1}]")
+//         Ok(rs) => println("${list.len(rs)} ${rs[0].value ?? 0.0}")   // 1 23.1
+//         Err(e) => println(senmllist.error_message(e))
+// ```
+pub @tier(app)
+fn from_json(text: Str) -> Result<[SenmlRecord], SenmlError>
+    match json.parse(text)
+        None       => Err(SenmlBadJson("the text does not parse"))
+        Some(root) =>
+            match json.to_list(root)
+                None        => Err(SenmlBadJson("the top level is not an array"))
+                Some(items) =>
+                    var out: [SenmlRecord] = []
+                    var i = 0
+                    for el in items
+                        match record_of_json(el, i)
+                            Err(e) =>
+                                return Err(e)
+                            Ok(r)  =>
+                                out = list.push(out, r)
+                        i = i + 1
+                    Ok(out)
+
+// A JSON number: a whole number is written as an integer.
+fn jnumber(v: Float) -> JsonValueH
+    if v > -9007199254740992.0 and v < 9007199254740992.0 and (v as Int as Float) == v
+        return json.int(v as Int)
+    json.float(v)
+
+// The JSON object of a record, with the fields in the order of the RFC's
+// examples.
+fn json_of_record(r: SenmlRecord) -> JsonValueH
+    var kvs: [(Str, JsonValueH)] = []
+    match r.base_name
+        Some(x) =>
+            kvs = list.push(kvs, ("bn", json.string(x)))
+        None    => 0
+    match r.base_time
+        Some(x) =>
+            kvs = list.push(kvs, ("bt", jnumber(x)))
+        None    => 0
+    match r.base_unit
+        Some(x) =>
+            kvs = list.push(kvs, ("bu", json.string(x)))
+        None    => 0
+    match r.base_value
+        Some(x) =>
+            kvs = list.push(kvs, ("bv", jnumber(x)))
+        None    => 0
+    match r.base_sum
+        Some(x) =>
+            kvs = list.push(kvs, ("bs", jnumber(x)))
+        None    => 0
+    match r.version
+        Some(x) =>
+            kvs = list.push(kvs, ("bver", json.int(x)))
+        None    => 0
+    match r.name
+        Some(x) =>
+            kvs = list.push(kvs, ("n", json.string(x)))
+        None    => 0
+    match r.unit
+        Some(x) =>
+            kvs = list.push(kvs, ("u", json.string(x)))
+        None    => 0
+    match r.time
+        Some(x) =>
+            kvs = list.push(kvs, ("t", jnumber(x)))
+        None    => 0
+    match r.update_time
+        Some(x) =>
+            kvs = list.push(kvs, ("ut", jnumber(x)))
+        None    => 0
+    match r.value
+        Some(x) =>
+            kvs = list.push(kvs, ("v", jnumber(x)))
+        None    => 0
+    match r.string_value
+        Some(x) =>
+            kvs = list.push(kvs, ("vs", json.string(x)))
+        None    => 0
+    match r.bool_value
+        Some(x) =>
+            kvs = list.push(kvs, ("vb", json.bool(x)))
+        None    => 0
+    match r.data_value
+        Some(x) =>
+            kvs = list.push(kvs, ("vd", json.string(base64url_encode(x))))
+        None    => 0
+    match r.sum
+        Some(x) =>
+            kvs = list.push(kvs, ("s", jnumber(x)))
+        None    => 0
+    json.object(kvs)
+
+// Write a list of records as `application/senml+json`.
+//
+// ```novo
+// use senmllist
+//
+// fn main() [io]
+//     println(senmllist.to_json([senmllist.reading("temp", "Cel", 23.5)]))   // [{"n":"temp","u":"Cel","v":23.5}]
+// ```
+pub @tier(app)
+fn to_json(rs: [SenmlRecord]) -> Str
+    var items: [JsonValueH] = []
+    for r in rs
+        items = list.push(items, json_of_record(r))
+    json.stringify(json.array(items))
+
+// The number a CBOR value holds, or `None`: an integer, a float of any width,
+// or a decimal fraction.
+fn cbor_number(v: CborValue) -> ?Float
+    match v
+        CborUnsigned(n)       => Some(n as Float)
+        CborNegative(n)       => Some(n as Float)
+        CborFloat16(f)        => Some(f)
+        CborFloat32(f)        => Some(f)
+        CborFloat64(f)        => Some(f)
+        CborTagged(tag, item) => cbor_decimal(tag, item)
+        _                     => None
+
+// The number of a decimal fraction, tag 4 on an array of an exponent and a
+// mantissa.
+fn cbor_decimal(tag: Int, item: CborValue) -> ?Float
+    if tag != 4
+        return None
+    match item
+        CborArray(xs) => cbor_decimal_parts(xs)
+        _             => None
+
+// The number in the two elements of a decimal fraction.
+fn cbor_decimal_parts(xs: [CborValue]) -> ?Float
+    if list.len(xs) != 2
+        return None
+    let e = cbor_int(xs[0]) ?? 100
+    let m = cbor_int(xs[1])
+    if e > 22 or e < -22 or m == None
+        return None
+    if e < 0
+        return Some((m ?? 0) as Float / pow10(0 - e))
+    Some((m ?? 0) as Float * pow10(e))
+
+// The integer a CBOR value holds, or `None`.
+fn cbor_int(v: CborValue) -> ?Int
+    match v
+        CborUnsigned(n) => Some(n)
+        CborNegative(n) => Some(n)
+        _               => None
+
+// The text a CBOR value holds, or `None`.
+fn cbor_text(v: CborValue) -> ?Str
+    match v
+        CborText(t) => Some(t)
+        _           => None
+
+// The number in a field, or the error that names the field.
+fn num_field(v: CborValue, index: Int, field: Str) -> Result<Float, SenmlError>
+    match cbor_number(v)
+        Some(x) => Ok(x)
+        None    => Err(SenmlBadField(index, field))
+
+// The text in a field, or the error that names the field.
+fn text_field(v: CborValue, index: Int, field: Str) -> Result<Str, SenmlError>
+    match cbor_text(v)
+        Some(x) => Ok(x)
+        None    => Err(SenmlBadField(index, field))
+
+// Record `index` read from a CBOR map, or the error.
+fn record_of_cbor(pairs: [CborPair], index: Int) -> Result<SenmlRecord, SenmlError>
+    var r = record()
+    for pair in pairs
+        var label = 0
+        var is_text = false
+        match pair.key
+            CborUnsigned(n) =>
+                label = n
+            CborNegative(n) =>
+                label = n
+            CborText(t)     =>
+                is_text = true
+                if str.len(t) > 0 and str.byte_at_or(t, str.len(t) - 1, 0) == 95
+                    return Err(SenmlUnsupportedLabel(index, t))
+            _               =>
+                return Err(SenmlBadCbor("record ${index} has a key that is not a label"))
+        if not is_text
+            match apply_field(r, label, pair.value, index)
+                Err(e)   =>
+                    return Err(e)
+                Ok(next) =>
+                    r = next
+    Ok(r)
+
+// Put one field into the record. A label this package does not know leaves it
+// as it was.
+fn apply_field(r: SenmlRecord, label: Int, v: CborValue,
+               index: Int) -> Result<SenmlRecord, SenmlError>
+    var out = r
+    if label == -1
+        match cbor_int(v)
+            Some(x) =>
+                out.version = Some(x)
+            None    =>
+                return Err(SenmlBadField(index, "bver"))
+    else if label == -2
+        match text_field(v, index, "bn")
+            Ok(x)  =>
+                out.base_name = Some(x)
+            Err(e) =>
+                return Err(e)
+    else if label == -3
+        match num_field(v, index, "bt")
+            Ok(x)  =>
+                out.base_time = Some(x)
+            Err(e) =>
+                return Err(e)
+    else if label == -4
+        match text_field(v, index, "bu")
+            Ok(x)  =>
+                out.base_unit = Some(x)
+            Err(e) =>
+                return Err(e)
+    else if label == -5
+        match num_field(v, index, "bv")
+            Ok(x)  =>
+                out.base_value = Some(x)
+            Err(e) =>
+                return Err(e)
+    else if label == -6
+        match num_field(v, index, "bs")
+            Ok(x)  =>
+                out.base_sum = Some(x)
+            Err(e) =>
+                return Err(e)
+    else
+        return apply_regular(out, label, v, index)
+    Ok(out)
+
+// The regular labels, 0 to 8.
+fn apply_regular(r: SenmlRecord, label: Int, v: CborValue,
+                 index: Int) -> Result<SenmlRecord, SenmlError>
+    var out = r
+    if label == 0
+        match text_field(v, index, "n")
+            Ok(x)  =>
+                out.name = Some(x)
+            Err(e) =>
+                return Err(e)
+    else if label == 1
+        match text_field(v, index, "u")
+            Ok(x)  =>
+                out.unit = Some(x)
+            Err(e) =>
+                return Err(e)
+    else if label == 2
+        match num_field(v, index, "v")
+            Ok(x)  =>
+                out.value = Some(x)
+            Err(e) =>
+                return Err(e)
+    else if label == 3
+        match text_field(v, index, "vs")
+            Ok(x)  =>
+                out.string_value = Some(x)
+            Err(e) =>
+                return Err(e)
+    else if label == 4
+        match v
+            CborBool(b) =>
+                out.bool_value = Some(b)
+            _           =>
+                return Err(SenmlBadField(index, "vb"))
+    else if label == 5
+        match num_field(v, index, "s")
+            Ok(x)  =>
+                out.sum = Some(x)
+            Err(e) =>
+                return Err(e)
+    else if label == 6
+        match num_field(v, index, "t")
+            Ok(x)  =>
+                out.time = Some(x)
+            Err(e) =>
+                return Err(e)
+    else if label == 7
+        match num_field(v, index, "ut")
+            Ok(x)  =>
+                out.update_time = Some(x)
+            Err(e) =>
+                return Err(e)
+    else if label == 8
+        match v
+            CborBytes(b) =>
+                out.data_value = Some(b)
+            _            =>
+                return Err(SenmlBadField(index, "vd"))
+    Ok(out)
+
+// Read a SenML pack from CBOR into a list of records.
+//
+// The document is an array of maps with the integer labels of RFC 8428
+// Table 4. A text label is an extension: skipped, or an error when it ends in
+// an underscore. A label that is an integer and not in the table is skipped.
+//
+// ```novo
+// use std.bytes
+// use senmllist
+//
+// fn main() [io]
+//     // [{0: "t", 2: 23}]
+//     let doc = bytes.from_byte_list([0x81, 0xA2, 0x00, 0x61, 0x74, 0x02, 0x17])
+//     match senmllist.from_cbor(doc)
+//         Ok(rs) => println("${list.len(rs)} ${rs[0].value ?? 0.0}")   // 1 23
+//         Err(e) => println(senmllist.error_message(e))
+// ```
+pub @tier(app)
+fn from_cbor(src: Bytes) -> Result<[SenmlRecord], SenmlError>
+    match cborfmt.decode(src)
+        Err(_)   => Err(SenmlBadCbor("the bytes do not decode"))
+        Ok(root) =>
+            match root
+                CborArray(items) => records_of_cbor(items)
+                _                => Err(SenmlBadCbor("the top level is not an array"))
+
+// The records of the items of a CBOR array.
+fn records_of_cbor(items: [CborValue]) -> Result<[SenmlRecord], SenmlError>
+    var out: [SenmlRecord] = []
+    var i = 0
+    for item in items
+        match item
+            CborMap(pairs) =>
+                match record_of_cbor(pairs, i)
+                    Err(e) =>
+                        return Err(e)
+                    Ok(r)  =>
+                        out = list.push(out, r)
+            _              =>
+                return Err(SenmlBadCbor("record ${i} is not a map"))
+        i = i + 1
+    Ok(out)
+
+// A number as CBOR: a whole number as an integer, the rest as a double.
+fn cnumber(v: Float) -> CborValue
+    if v > -9007199254740992.0 and v < 9007199254740992.0 and (v as Int as Float) == v
+        let n = v as Int
+        if n >= 0
+            return CborUnsigned(n)
+        return CborNegative(n)
+    CborFloat64(v)
+
+// A pair with an integer label.
+fn cpair(label: Int, v: CborValue) -> CborPair
+    if label >= 0
+        return CborPair { key: CborUnsigned(label), value: v }
+    CborPair { key: CborNegative(label), value: v }
+
+// The CBOR map of a record, with the fields in the order of the RFC's examples.
+fn cbor_of_record(r: SenmlRecord) -> CborValue
+    var ps: [CborPair] = []
+    match r.base_name
+        Some(x) =>
+            ps = list.push(ps, cpair(-2, CborText(x)))
+        None    => 0
+    match r.base_time
+        Some(x) =>
+            ps = list.push(ps, cpair(-3, cnumber(x)))
+        None    => 0
+    match r.base_unit
+        Some(x) =>
+            ps = list.push(ps, cpair(-4, CborText(x)))
+        None    => 0
+    match r.base_value
+        Some(x) =>
+            ps = list.push(ps, cpair(-5, cnumber(x)))
+        None    => 0
+    match r.base_sum
+        Some(x) =>
+            ps = list.push(ps, cpair(-6, cnumber(x)))
+        None    => 0
+    match r.version
+        Some(x) =>
+            ps = list.push(ps, cpair(-1, cnumber(x as Float)))
+        None    => 0
+    match r.name
+        Some(x) =>
+            ps = list.push(ps, cpair(0, CborText(x)))
+        None    => 0
+    match r.unit
+        Some(x) =>
+            ps = list.push(ps, cpair(1, CborText(x)))
+        None    => 0
+    match r.time
+        Some(x) =>
+            ps = list.push(ps, cpair(6, cnumber(x)))
+        None    => 0
+    match r.update_time
+        Some(x) =>
+            ps = list.push(ps, cpair(7, cnumber(x)))
+        None    => 0
+    match r.value
+        Some(x) =>
+            ps = list.push(ps, cpair(2, cnumber(x)))
+        None    => 0
+    match r.string_value
+        Some(x) =>
+            ps = list.push(ps, cpair(3, CborText(x)))
+        None    => 0
+    match r.bool_value
+        Some(x) =>
+            ps = list.push(ps, cpair(4, CborBool(x)))
+        None    => 0
+    match r.data_value
+        Some(x) =>
+            ps = list.push(ps, cpair(8, CborBytes(x)))
+        None    => 0
+    match r.sum
+        Some(x) =>
+            ps = list.push(ps, cpair(5, cnumber(x)))
+        None    => 0
+    CborMap(ps)
+
+// Write a list of records as `application/senml+cbor`, with definite lengths
+// throughout.
+//
+// ```novo
+// use std.bytes
+// use senmllist
+//
+// fn main() [io]
+//     let doc = senmllist.to_cbor([senmllist.reading("t", "Cel", 23.0)])
+//     println("${bytes.len(doc)}")   // 12
+// ```
+pub @tier(app)
+fn to_cbor(rs: [SenmlRecord]) -> Bytes
+    var items: [CborValue] = []
+    for r in rs
+        items = list.push(items, cbor_of_record(r))
+    cborfmt.encode(CborArray(items), CborShortest)
+
+// The base fields that carry over from one record to the next.
+struct Bases
+    name: Str
+    unit: ?Str
+    time: Float
+    value: Float
+    has_value: Bool
+    sum: Float
+    has_sum: Bool
+
+// The number of value fields a record itself has among `v`, `vs`, `vb`, `vd`.
+fn value_kinds(r: SenmlRecord) -> Int
+    var n = 0
+    if r.value != None
+        n = n + 1
+    if r.string_value != None
+        n = n + 1
+    if r.bool_value != None
+        n = n + 1
+    if r.data_value != None
+        n = n + 1
+    n
+
+// Resolve record `index` against the bases in force.
+fn resolve_one(r: SenmlRecord, b: Bases, index: Int) -> Result<SenmlResolved, SenmlError>
+    let joined = b.name + (r.name ?? "")
+    if not senmlunit.name_is_valid(joined)
+        return Err(SenmlBadName(index, joined))
+    let kinds = value_kinds(r)
+    if kinds > 1
+        return Err(SenmlBadValue(index, "more than one of v, vs, vb and vd"))
+    if kinds == 0 and r.sum == None
+        return Err(SenmlBadValue(index, "no value and no sum"))
+    var value: ?Float = None
+    if r.value != None
+        value = Some((r.value ?? 0.0) + b.value)
+    var sum: ?Float = None
+    if r.sum != None or b.has_sum
+        sum = Some((r.sum ?? 0.0) + b.sum)
+    let t = b.time + (r.time ?? 0.0)
+    Ok(SenmlResolved { name: joined, unit: r.unit ?? b.unit, value: value,
+                       string_value: r.string_value, bool_value: r.bool_value,
+                       data_value: r.data_value, sum: sum, time: t,
+                       relative: senmlunit.time_is_relative(t), update_time: r.update_time })
+
+// The bases after record `r`, which may state new ones.
+fn next_bases(r: SenmlRecord, b: Bases) -> Bases
+    var unit = b.unit
+    if r.base_unit != None
+        unit = r.base_unit
+    Bases { name: r.base_name ?? b.name, unit: unit, time: r.base_time ?? b.time,
+            value: r.base_value ?? b.value, has_value: b.has_value or r.base_value != None,
+            sum: r.base_sum ?? b.sum, has_sum: b.has_sum or r.base_sum != None }
+
+// Resolve a pack, section 4.6: apply the base fields to every record.
+//
+// The name of a record becomes its base name and its name together, the unit
+// its own or the base unit, the time the base time plus its own, the value and
+// the sum the base added to its own. A base field applies to its record and
+// every record after it, until another record states it again. The result has
+// no base fields and says whether each time is relative to now.
+//
+// The pack is checked as it is resolved: a version above 10 or one that
+// differs from the first record's, a name that is empty or outside the
+// permitted characters, and a record with more than one value or with none
+// and no sum are errors. The records are not put in chronological order.
+//
+// ```novo
+// use senmllist
+//
+// fn main() [io]
+//     let first = senmllist.reading("voltage", "V", 120.1)
+//     match senmllist.from_json("[{\"bn\":\"dev:\",\"bt\":1276020076.001,\"n\":\"v\",\"v\":1},{\"n\":\"c\",\"t\":-5,\"v\":2}]")
+//         Ok(rs) =>
+//             match senmllist.resolve(rs)
+//                 Ok(out) => println("${out[1].name} ${out[1].time} ${out[1].relative}")   // dev:c 1276020071.001 false
+//                 Err(e) => println(senmllist.error_message(e))
+//         Err(e) => println(senmllist.error_message(e))
+// ```
+pub @tier(app)
+fn resolve(rs: [SenmlRecord]) -> Result<[SenmlResolved], SenmlError>
+    var out: [SenmlResolved] = []
+    var b = Bases { name: "", unit: None, time: 0.0, value: 0.0, has_value: false, sum: 0.0,
+                    has_sum: false }
+    var version = 10
+    var i = 0
+    for r in rs
+        match r.version
+            Some(v) =>
+                if v > 10
+                    return Err(SenmlBadVersion(v))
+                if i > 0 and v != version
+                    return Err(SenmlBadVersion(v))
+                version = v
+            None    => 0
+        b = next_bases(r, b)
+        match resolve_one(r, b, i)
+            Err(e) =>
+                return Err(e)
+            Ok(x)  =>
+                out = list.push(out, x)
+        i = i + 1
+    Ok(out)
